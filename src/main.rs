@@ -1,29 +1,23 @@
-struct QuadNode {
-    minH: u16,
-    maxH: u16,
+use image::DynamicImage;
+use std::{error::Error, num::NonZero, path::PathBuf};
+use wgpu::{
+    ComputePipelineDescriptor, Device,
+    util::{BufferInitDescriptor, DeviceExt},
+};
+
+fn load_terrain(
+    height_path: PathBuf,
+    diffuse_path: PathBuf,
+) -> Result<(DynamicImage, DynamicImage), Box<dyn Error>> {
+    let heightmap = image::ImageReader::open(height_path)?.decode()?;
+    let diffuse = image::ImageReader::open(diffuse_path)?.decode()?;
+    Ok((heightmap, diffuse))
 }
-
-struct NodeGrid {
-    nodes: Vec<QuadNode>,
-    side_len: usize,
-}
-
-impl NodeGrid {
-    pub fn new(side_len: usize) -> Self {
-        Self {
-            nodes: Vec::with_capacity(side_len * side_len),
-            side_len,
-        }
-    }
-
-    pub fn get_min_max_h(&self, x: usize, z: usize) -> &QuadNode {
-        return &self.nodes[(x + z * self.side_len) * 2];
-    }
-}
-const LOD_COUNT: usize = 5;
-
-type QuadMap = [NodeGrid; LOD_COUNT];
 
 fn main() {
-    println!("Hello, world!");
+    let (heightmap, diffuse) = load_terrain(
+        PathBuf::from("./res/heights.png"),
+        PathBuf::from("./res/diffuse.png"),
+    )
+    .expect("should load images");
 }

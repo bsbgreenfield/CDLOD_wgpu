@@ -25,11 +25,9 @@ in practice however, the only values that the node itself will need to carry is 
 LOD level is implicit in the  2d index of the node, and the center is extrapolated from its parent node.
 
 The 3d axis aligned bounding box can be calulated from its width (implicit from its LOD level) and its height (maxH - minH). 
-The node selelection process (TODO: insert section number), compares the AABB against the camera distance as the selection criteria
+The node selelection process, compares the AABB against the camera distance as the selection criteria
 
 so for example, with a world region extending from (x: -50, z: 50) in the top left and (x: 50, z: -50) in the bottom right (viewed from above)
-
-node 0 will be a bounding value encompassing the entire world region, with min and max height equal to the absolute min and max heights of the dataset
 
 nodes 1 - 4 are z-order subsets of node 0. So node 1 is the region bound by (-50, 50) - (0, 0),
 node 2 is the region bound by (0, 50) - (50, 0) and so on.
@@ -37,10 +35,8 @@ node 2 is the region bound by (0, 50) - (50, 0) and so on.
 As nodes are built, max and min height is calulated for that region (2d bounding square over the heightmap)
 
 We store the quad map as a List of node lists, where the node list length is equal to 4^d (1, 4, 16, 64 so on) and d is the index within the outer list, indicating LOD depth
+On the gpu, we can store this as a texture mipmap, where each quad level has a RGUInt32 value representing min | max height.
 
-
-We can imagine these node lists as a grid, to better match the physical modeling of whats going on
-but in practice it is stored as a flat array
 
 ```rust
 struct NodeGrid {
@@ -146,22 +142,28 @@ for LOD 5 for example, we would only sample once for every 2^5 (32) height value
 #### Tiles
 We can take advantage of this using  a similar technique to geometry clipmapping, where we first bake a height mipmap pyramid from the source data.
 Once we have the mipmapped height pyramid, in which the root is equal to the source (highest granularity) 
-and the lowest descendant at level D is the source downsampled* by 2^D, we can subdivide each layer into "tiles", much the same way as the source dataset itself is subdivded into nodes.
+and the lowest descendant at level D is the source downsampled* by 2^D, we can subdivide each layer into "tiles", much the same way as the source dataset itself is subdivided into nodes.
 
 Again, we have the mipmapped height data pyramid, and we can imagine it as an inverted physical pyramid where the peak contains the source (finest) data and the base contains the coarsest sampled data.
 We now split up each layer such that they each contain the same number of *nodes* which we will call R, as the ratio of node/tile.  
 
-#### The root tile
-The latter restriction here implies that the base of the pyramid wont actually be the coarsest level of detail 
-allowed, because that would techincally be a tile consisting of one node - the root node, and we specifically want R nodes in each tile, so we exclude layers in which the number of interior nodes is < R.
-Anything coarser than that is trivially seen be contained in that root tile, just at a slightly finer level of detail than is strictly required. 
-Therefore the root node is defined as the upper bound of the mipmap, in which there is exactly one tile with R nodes, and which is the ancestor of all requested data tiles
+#### The root tiles
+The number of mipmap subdivisions is derived from the min_node_size and the nodes_per_tile_axis requested by the user. 
+At LOD 0, all the nodes must necessarily span all the samples in the source dataset. 
+The highest LOD is then calculated as being equal to the MIP level at which there is at least one tile with
+"nodes_per_tile_axis" ^2 nodes contained in it. If the user also requested a mip level which is lower that
+the coarsest mip for which this is true, then its clamped there.
+Either way, there will be a max mip at which we can say the tile/tiles that span it are "root" tiles. Which 
+have the useful property of being the ancestors of all other tiles. We ensure that these root tiles are always resident
 
-#### Lower Mip Bound
-Just as the root tile is the upper bound of the inverted mipmip pyramid, so too should be defined a *lower bound* beyond which each lower LOD level node samples from.
-This lower bound must at least be defined as the *source* data, 
-but the user could also specify a maximum allowed source data size which could take in a finer source data set and set mip level 0 to be some downsampled version of this.
-In practice, we will never subdivide nodes below the lower bound.
+
+#### source cropping
+An invariant of this algorithm that must be upheld is that each mip level contains a whole number of tiles,
+and that each node has exactly one tile as its data source. This requirement makes the code simpler and allows use of the
+compute shader to request new tiles, because we can simultaneously check for child node data residency and request that tile 
+to become resident if not in the same pass. The side effect of this is that the algorithm doesnt necessarily work for 
+every shape of source data. Specifically, the source data must be subdivisable into a whole number of tiles.
+Therefore, we crop the source data if this isnt possible
 
 #### tile creation
 Recall the inverted pyramid: to create our tile subdivisions we can iterate from base to peak.
@@ -339,17 +341,16 @@ One dispatch per LOD, and we can do indirect compute dispatches to dynamically d
 // sample space: one unit = one sample
 // world space: one unit = one world unit
 
-struct MapDimensions {
-    minX: f32,
-    minY: f32,
-    minZ: f32,
-    sizeX: f32,
-    sizeY: f32,
-    sizeZ: f32,
+
+struct LODArgsIn {
+    wg_x: u32,
+    wg_y: u32,
+    wg_z: u32,
+    count: u32,
+
 }
 
-
-struct LODArgs {
+struct LODArgsOut {
     wg_x: atomic<u32>,
     wg_y: u32,
     wg_z: u32,
@@ -376,22 +377,23 @@ struct SelectedNode {
 }
 
 struct LevelInfo {
-    mm_offset: u32,
     node_size: u32,
-    nodes_per_axis: u32,
     lod_range: f32,
+    nodes_per_axis: vec2<u32>,
 }
 
 struct BakeValues {
-    map_dims: MapDimensions, 
+    map_min: vec3<f32>,
     max_mip: u32,
-    lower_mip_bound: u32,
+    map_size: vec3<u32>,
+    tile_size: u32,
+    heightmap_dims: vec2<u32>,
+    root_tiles: vec2<u32>, // always resident
+    scale_factors: vec3<f32>, // calculated as scales to convert from sample space to world space
+    nodes_per_tile_axis: u32, // must be even
+    min_node_size: u32,
     queue_capacity: u32,
     selected_capacity: u32,
-    heightmap_dims: vec2<u32>,
-    min_node_size: u32,
-    scale_factors: vec3<f32>, // calculated as scales to convert from sample space to world space
-    nodes_per_tile_axis: u32, // must be multiple of 4
     request_capacity: u32,
 }
 
@@ -400,82 +402,72 @@ struct RequestList {
     tiles: array<u32>,
 }
 
-const NOT_RESIDENT: u32 = 0xFFFFFFFFu;
+struct InQueue {
+    args: LODArgsIn,
+    queue: array<NodeWork>,
+}
+struct OutQueue {
+    args: LODArgsOut,
+    queue: array<NodeWork>,
+}
+const NOT_RESIDENT: u32 = 0xFFFFu;
 const WG_SIZE: u32 = 64u;
+const MAX_LODS = 16u;
 
-@group(0) @binding(0) var<storage, read_write> in_args:   LODArgs; // dispatch args for this dispatch 
-@group(0) @binding(1) var<storage, read>       in_queue:  array<NodeWork>;  
-@group(0) @binding(2) var<storage, read_write> out_args:  LODArgs;  // next level's args
-@group(0) @binding(3) var<storage, read_write> out_queue: array<NodeWork>; // next levels work
+@group(0) @binding(0) var<storage, read>       in_queue:   InQueue; // dispatch args for this dispatch  + scratch space
+@group(0) @binding(2) var<storage, read_write> out_queue:  OutQueue;  // next level's args
 
 @group(1) @binding(0) var<storage, read_write> selected_nodes:  array<SelectedNode>;
 @group(1) @binding(1) var<uniform>             frustum:         Frustum;
 @group(1) @binding(2) var<uniform>             camera:          Camera;
 @group(1) @binding(3) var<storage, read_write> draw_args:       RenderIndirectArgs;
 
-@group(2) @binding(0) var<storage, read>       min_max_heights: array<u32>;
+@group(2) @binding(0) var                      min_max_heights: texture_2d<u32>; // mipmap of height vals 
 @group(2) @binding(1) var<uniform>             bake_values:     BakeValues;
-@group(2) @binding(2) var<storage, read>       levels:          array<LevelInfo>;
+@group(2) @binding(2) var<uniform>             levels:          array<LevelInfo, MAX_LODS>;
 
-@group(3) @binding(0) var<storage, read>       residency:       array<u32>; // residency array where each tile is ether given an index, or not resident
+@group(3) @binding(0) var                      residency:       texture_2d<u32>; // residency array for tiles
 @group(3) @binding(1) var<storage, read_write> request_flags:   array<atomic<u32>>;
 @group(3) @binding(2) var<storage, read_write> requests:        RequestList;        
 
 
-// get the index of the node from the xz coordinates in LOD space of the node
-fn node_index(lod: u32, x: u32, z: u32) -> u32 {
-    let li = levels[lod];
-    return li.mm_offset + z * li.nodes_per_axis + x;
-}
 fn frustum_intersects(aabb: AABB) -> bool {
     // TODO: frustum code
     return true;
 }
 
-fn ideal_mip(lod: u32) -> i32 {
-    return min(i32(lod) - i32(bake_values.lower_mip_bound), i32(bake_values.max_mip));
+fn get_tile_residency(mip: u32, t_coords: vec2<u32>) -> u32 {
+    return textureLoad(residency, t_coords, mip).r;
 }
 
-fn tile_index(mip: u32, x: u32, z: u32, node_scale: u32) -> u32 {
-    // node scale = 0 if checking residency for this node, or 1 if checking for childs residency 
-    // scale xy, divide by nodes per tile to get TILE SPACE coordinates
-    let t_coords = (vec2<u32>(x, z) << vec2(node_scale)) / bake_values.nodes_per_tile_axis;
+fn tile_flat_index(mip: u32, t_coords: vec2<u32>) -> u32 {
     let mips_coarser = bake_values.max_mip - mip;
-    let tiles_per_axis = 1u << mips_coarser; 
-    let tile_offset = ((1u << (2u * mips_coarser)) - 1u) / 3u;
-    return tile_offset + t_coords.y * tiles_per_axis + t_coords.x;
+    let roots = bake_values.root_tiles.x * bake_values.root_tiles.y;
+    let base_offset = roots * ((1u << (2u * mips_coarser)) - 1u) / 3u;
+    let tiles_x = bake_values.root_tiles.x << mips_coarser;
+    return base_offset + t_coords.y * tiles_x + t_coords.x;
 }
 
-fn request_tile(tile_idx: u32) {
+fn request_tile(mip: u32, t_coords: vec2<u32>) {
+    let tile_index = tile_flat_index(mip, t_coords);
     // set request flag, exit if already requested
-    if (atomicExchange(&request_flags[tile_idx], 1u) == 0u) {
+    if (atomicExchange(&request_flags[tile_index], 1u) == 0u) {
         // increment request count
         let i = atomicAdd(&requests.count, 1u);
         // set request
         if (i < bake_values.request_capacity) { 
-            requests.tiles[i] = tile_idx; 
+            requests.tiles[i] = tile_index; 
             }
     }
 }
 
 fn children_resident(lod: u32, x: u32, z: u32) -> bool {
-    let child_lod = lod - 1u;
-    // the ideal mip for the childs lod is the one at lod, 
-    // clamped by max mip on the upper range, 
-    // and clamped by lower_mip_bound on the low range
-    let m = ideal_mip(child_lod);
-    // if m is less than zero, it samples from the source mip
-    if (m < 0) {
-        return false;
-    }
+    let t_coords = (vec2<u32>(x, z) * 2u) / bake_values.nodes_per_tile_axis;
+    let residency = get_tile_residency(lod - 1u, t_coords);
 
-    let mip = u32(m);
-    if (mip == bake_values.max_mip) {
-        return true;
-    }
-    let tile_idx = tile_index(mip, x, z, 1);
-    if residency[tile_idx] == NOT_RESIDENT {
-        request_tile(tile_idx);
+    // request children's tile
+    if residency == NOT_RESIDENT {
+        request_tile(lod - 1u, t_coords);
         return false;
     }
     return true;
@@ -496,21 +488,21 @@ fn get_aabb(lod: u32, minH: u32, maxH: u32, x: u32, z: u32) -> AABB {
     // get min and max with bit shifts
     let node_size = levels[lod].node_size;
     let s0 = vec2<u32>(x, z) * node_size; // LOD space -> sample space
-    let s1 = s0 + vec2<u32>(size);
-    let m = bake_values.map_dims;
+    let s1 = s0 + vec2<u32>(node_size);
+    let map_mins = bake_values.map_min;
     let sf = bake_values.scale_factors;
 
     // convert from LOD space to sample space to world space
     return AABB (
         vec3( 
-            m.minX + f32(s0.x) * sf.x,
-            m.minY + f32(minH) * sf.y,
-            m.minZ + f32(s0.y) * sf.z,
+            map_mins.x + f32(s0.x) * sf.x,
+            map_mins.y + f32(minH) * sf.y,
+            map_mins.z + f32(s0.y) * sf.z,
         ),
         vec3( 
-            m.minX + f32(s1.x) * sf.x, 
-            m.minY + f32(maxH) * sf.y, 
-            m.minZ + f32(s1.y) * sf.z
+            map_mins.x + f32(s1.x) * sf.x, 
+            map_mins.y + f32(maxH) * sf.y, 
+            map_mins.z + f32(s1.y) * sf.z
         )
     );
 }
@@ -523,17 +515,15 @@ fn get_aabb(lod: u32, minH: u32, maxH: u32, x: u32, z: u32) -> AABB {
 // every invocation already expects that this nodes aabb is contained in the current lod range (though not necessarily the frustum)
 @compute @workgroup_size(64) 
 fn select_nodes_for_level(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= min(in_args.count, bake_values.queue_capacity)) {return;} // skip if this thread has no node to process
-    let node_work = in_queue[gid.x]; // the node for this thread
+    if (gid.x >= min(in_queue.args.count, bake_values.queue_capacity)) {return;} // skip if this thread has no node to process
+    let node_work = in_queue.queue[gid.x]; // the node for this thread
     let lod = node_work.lod;
     let x = (node_work.xz >> 16u) & 0xFFFF; // hi bits
     let z = (node_work.xz & 0xFFFF); // lo bits
-    let node_idx: u32 = node_index(node_work.lod, x, z);
-    let mm: u32 = min_max_heights[node_idx];
-    let minH = mm >> 16u ;
-    let maxH = mm & 0xFFFF;
 
-    let aabb = get_aabb(lod, minH, maxH, x, z);
+    let mm = textureLoad(min_max_heights, vec2<u32>(x,z), lod).rg;
+
+    let aabb = get_aabb(lod, mm.r, mm.g, x, z);
 
     if (!frustum_intersects(aabb)) {
         return;
@@ -543,26 +533,28 @@ fn select_nodes_for_level(@builtin(global_invocation_id) gid: vec3<u32>) {
     // then we should include the child nodes in the node work for the next dispatch
     // also use this tile if the children nodes dont have residency
     if (lod > 0u && in_lod_range(lod - 1u, aabb) && children_resident(lod, x, z)) {
-       let base = atomicAdd(&out_args.count, 4u); // increase the count by 4, to handle 4 new children, store pre count
+       let base = atomicAdd(&out_queue.args.count, 4u); // increase the count by 4, to handle 4 new children, store pre count
        if (base + 4u <= bake_values.queue_capacity) { // guard against queue overflow. If the queue is full, then we have to just draw the node as this level.
             for (var i = 0u; i < 4u; i++) {
                 // bit magic to obtain the child LOD space coordinates
                 let child_x = (x << 1u) | (i & 1u);
                 let child_z = (z << 1u) | (i >> 1u);
                 let cx_cz = ((child_x << 16u) | child_z);
-                out_queue[base + i] = NodeWork(cx_cz, lod - 1u);
+                out_queue.queue[base + i] = NodeWork(cx_cz, lod - 1u);
             }
             // adjust the required workgroup size of the next dispatch based on the number of 
             // nodes that it needs to process
-            atomicMax(&out_args.wg_x, (base + 4u + WG_SIZE - 1u) / WG_SIZE);
+            atomicMax(&out_queue.args.wg_x, (base + 4u + WG_SIZE - 1u) / WG_SIZE);
             return;
        }
     }
 
-    let ideal_mip = ideal_mip(lod);
-    // FAILS IDEAL MIP IS I32
-    let tile_idx = tile_index(ideal_mip, x, z);
-    let tile_slot = residency[tile_idx];
+
+    // this nodes tile is gauranteed resident, because the last compute
+    // pass already checked if its children were resident before subdividing
+    let t_coords = vec2<u32>(x, z) / bake_values.nodes_per_tile_axis;
+    let tile_slot = get_tile_residency(lod, t_coords);
+
 
     // get the instance idx for the selected node, increment for next
     let i = atomicAdd(&draw_args.instance_count, 1u); 
@@ -574,3 +566,17 @@ fn select_nodes_for_level(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ```
 
+### TODO:
+1.  load terrain heightmap and diffuse
+2.  create heightmap and diffuse mipmaps
+3.  generate normal texture from heightmap, create mipmap
+4.  create minmax height texture from heightmap, create mipmap
+5.  create interface for selecting sections of the heightmap mipmap as "tiles"
+6.  generate BakeValues struct from CDLOD settings and heighmap data
+7.  generate LevelInfo per LOD level (node_size, LOD ranges, nodes per axis)
+8.  create bind group layout for node select compute shader
+9.  create bind groups/ buffers for all compute pass items
+10. node select compute shader
+11. process tile requests, update residency buffer, write tiles to a GPU terrain texture
+12. render pass using selected nodes, tile slots
+13. morphs

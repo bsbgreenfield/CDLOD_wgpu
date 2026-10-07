@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+exr = "1.74.2"
+image = "0.25.10"
+pollster = "1.0.1"
+wgpu = "30.0.1"
