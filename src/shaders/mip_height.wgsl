@@ -9,7 +9,7 @@ struct Params {
 
 
 @compute @workgroup_size(8,8)
-fn main(@builtin(global_invocation_id): gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 	if (any(gid.xy >= params.dst_size)) { return; }
 	let h = textureLoad(src, gid.xy * 2u, 0).r;
 	textureStore(dst, gid.xy, vec4<u32>(h, 0u,0u, 0u));

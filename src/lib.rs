@@ -1,8 +1,13 @@
 use std::num::NonZero;
 
+use crate::tiles::TerrainSize;
+
+mod bake;
+mod compress;
 mod mips;
 mod tiles;
 pub struct CDLODSettings {
+    terrain_size: TerrainSize,
     /// the minimum number of samples in sample space of the source terrain texture
     /// that a quad node is allowed to span.
     /// if min_quad_node_size = 1, then each node at LOD 0 represent a single sample.

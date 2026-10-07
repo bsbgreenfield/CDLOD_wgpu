@@ -1,6 +1,29 @@
-use crate::{CDLODSettings, mips::MipChain};
+use crate::CDLODSettings;
 
 const MAX_LODS: u32 = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerrainSize {
+    T2,
+    T4,
+    T8,
+    T16,
+}
+
+impl TerrainSize {
+    pub(crate) const fn intervals(self) -> u32 {
+        match self {
+            TerrainSize::T2 => 2048,
+            TerrainSize::T4 => 4096,
+            TerrainSize::T8 => 8192,
+            TerrainSize::T16 => 16384,
+        }
+    }
+
+    pub(crate) const fn samples(self) -> u32 {
+        self.intervals() + 1
+    }
+}
 
 pub(crate) struct TileLayout {
     /// The top mip level which equals the top quad LOD. Contains the root tiles
@@ -14,7 +37,43 @@ pub(crate) struct TileLayout {
     pub root_tiles: [u32; 2],
 
     /// the source size in samples after cropping
-    pub cropped_size: [u32; 2],
+    pub size: u32,
+}
+
+struct TileStore {
+    offsets: Vec<u64>,
+    blob: memmap2::Mmap,
+    ddict: zstd::dict::DecoderDictionary<'static>,
+    n: usize,
+}
+
+struct TileDecoder<'a> {
+    decompressor: zstd::bulk::Decompressor<'a>,
+    scratch: Vec<u8>, // persistent allocation for moving data
+}
+
+impl TileStore {
+    pub fn decoder(&self) -> std::io::Result<TileDecoder<'_>> {
+        Ok(TileDecoder {
+            decompressor: zstd::bulk::Decompressor::with_prepared_dictionary(&self.ddict)?,
+            scratch: vec![0; self.n * self.n * 2],
+        })
+    }
+
+    /// tile_index comes straight from RequestList.tiles[]
+    pub fn load(
+        &self,
+        dec: &mut TileDecoder,
+        tile_index: u32,
+        out: &mut [u16],
+    ) -> std::io::Result<()> {
+        let i = tile_index as usize;
+        let src = &self.blob[self.offsets[i] as usize..self.offsets[i + 1] as usize];
+        dec.decompressor
+            .decompress_to_buffer(src, dec.scratch.as_mut_slice())?;
+        crate::compress::decode_heights(&dec.scratch, self.n, out);
+        Ok(())
+    }
 }
 
 impl TileLayout {
@@ -30,8 +89,12 @@ impl TileLayout {
         // tile size is constant in mip space
         let tile_size = node_size * nodes_per_tile_axis;
 
-        // sample count for the tiles
-        let intervals = (width - 1).min(height - 1);
+        let intervals = settings.terrain_size.intervals();
+
+        assert!(
+            tile_size.is_power_of_two(),
+            "min_quad_node_size * nodes_per_tile_axis must be a power of 2"
+        );
 
         assert!(
             intervals >= tile_size,
@@ -39,29 +102,23 @@ impl TileLayout {
             Consider decreasing min_quad_node_size in the settings"
         );
 
-        // the number of mips comes from the number of subdivisions it takes
-        // to get from a single root tile, to the point where a tile is sampling from the source
-        // dataset (necessarily mip 0), or the max_LOD specified by the user
-        let max_mip = (intervals / tile_size).ilog2().min(settings.max_LOD.get());
-        assert!(max_mip < MAX_LODS, "The source dataset is too large");
+        let tiles_per_axis = intervals / tile_size;
+        let max_mip = tiles_per_axis.ilog2().min(settings.max_LOD.get());
+        assert!(max_mip < MAX_LODS, " the source dataset is too large");
 
-        // the "root tiles" are the tiles at the highest mip, and
-        // are special because they are always gpu resident, and are ancestors of all
-        // tiles. The normal case is a single root tile.
-        let root_span = tile_size << max_mip; // sample span (of source) per root
-        let root_tiles = [(width - 1) / root_span, (height - 1) / root_span];
+        let roots = tiles_per_axis >> max_mip;
 
         let layout = TileLayout {
             max_mip,
             tile_size,
             nodes_per_tile_axis,
-            root_tiles,
-            cropped_size: [root_tiles[0] * root_span + 1, root_tiles[1] * root_span + 1],
+            root_tiles: [roots, roots],
+            size: settings.terrain_size.samples(),
         };
         layout
     }
 
-    fn tiles_per_axis(&self, mip: u32) -> [u32; 2] {
+    pub(crate) fn tiles_per_axis(&self, mip: u32) -> [u32; 2] {
         let shift = self.max_mip - mip;
         let x = self.root_tiles[0] << shift;
         let z = self.root_tiles[1] << shift;
@@ -75,7 +132,7 @@ impl TileLayout {
         offset + tile_coords[1] * self.tiles_per_axis(mip)[0] + tile_coords[0]
     }
 
-    fn tile_count(&self) -> u32 {
+    pub(crate) fn tile_count(&self) -> u32 {
         let roots = self.root_tiles[0] * self.root_tiles[1];
         roots * ((1 << (2 * (self.max_mip + 1))) - 1) / 3
     }

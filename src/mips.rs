@@ -1,11 +1,210 @@
 use crate::{CDLODSettings, tiles::TileLayout};
+use image::{ImageBuffer, Luma};
+use rayon::{
+    iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
+    slice::ParallelSliceMut,
+};
 use wgpu::util::DeviceExt;
+use zstd::zstd_safe::CParameter;
 
-pub(crate) struct MipChain {
-    pub texture: wgpu::Texture,
-    pub level_sizes: Vec<[u32; 2]>,
+pub(crate) struct HeightMips {
+    pub(crate) level_sizes: Vec<u32>,
+    pub(crate) levels: Vec<Vec<u16>>,
 }
 
+impl HeightMips {
+    fn row(&self, mip: u32, z: u32) -> &[u16] {
+        let n = self.level_sizes[mip as usize] as usize;
+        &self.levels[mip as usize][z as usize * n..][..n]
+    }
+}
+
+fn min_max_levels(
+    mips: &HeightMips,
+    node_size: usize,
+    lod_count: usize,
+) -> (u32, Vec<Vec<[u16; 2]>>) {
+    let level_size = mips.level_sizes[0] as usize;
+    let heights = &mips.levels[0];
+    let node_count = (level_size - 1) / node_size;
+    let mut level0 = vec![[0u16; 2]; node_count * node_count];
+    level0
+        .par_chunks_mut(node_count)
+        .enumerate()
+        .for_each(|(nz, row)| {
+            for (nx, mm) in row.iter_mut().enumerate() {
+                let (mut min_h, mut max_h) = (u16::MAX, 0u16);
+                for z in nz * node_size..(nz * node_size + node_size) + 1 {
+                    for &v in &heights[z * level_size + nx * node_size..][..(node_size + 1)] {
+                        min_h = min_h.min(v);
+                        max_h = max_h.max(v);
+                    }
+                }
+                *mm = [min_h, max_h];
+            }
+        });
+
+    let mut levels = vec![level0];
+    for lod in 1..lod_count as usize {
+        let prev = levels.last().unwrap();
+        let prev_n = node_count >> (lod - 1);
+        let node_count = node_count >> lod;
+        let mut level = vec![[0u16; 2]; node_count * node_count];
+        level
+            .par_chunks_mut(node_count)
+            .enumerate()
+            .for_each(|(z, row)| {
+                let r0 = &prev[2 * z * prev_n..][..prev_n];
+                let r1 = &prev[(2 * z + 1) * prev_n..][..prev_n];
+                for (x, mm) in row.iter_mut().enumerate() {
+                    let c = [r0[2 * x], r0[2 * x + 1], r1[2 * x], r1[2 * x + 1]];
+                    *mm = [
+                        c.iter().map(|m| m[0]).min().unwrap(),
+                        c.iter().map(|m| m[1]).max().unwrap(),
+                    ];
+                }
+            });
+        levels.push(level);
+    }
+    (node_count as u32, levels)
+}
+
+pub(crate) fn build_compressed_tile_files(
+    tile_layout: &TileLayout,
+    mips: &HeightMips,
+) -> std::io::Result<()> {
+    let tile_sample_count = (tile_layout.tile_size + 1) as usize;
+
+    let mut tile_ids: Vec<(u32, u32, u32)> = Vec::new();
+    let mip_count = tile_layout.max_mip + 1;
+    for mip in (0..mip_count).rev() {
+        let [tx_count, tz_count] = tile_layout.tiles_per_axis(mip);
+        for z in 0..tz_count {
+            for x in 0..tx_count {
+                tile_ids.push((mip, x, z));
+            }
+        }
+    }
+
+    let payloads: Vec<Vec<u8>> = tile_ids
+        .par_iter()
+        .map(|&(mip, tile_x, tile_z)| {
+            let x0 = tile_x as usize * tile_sample_count;
+            let mut tile =
+                Vec::with_capacity((tile_layout.tile_size * tile_layout.tile_size) as usize);
+            for j in 0..tile_sample_count as u32 {
+                tile.extend_from_slice(
+                    &mips.row(mip, tile_z * tile_layout.tile_size + j)[x0..x0 + tile_sample_count],
+                );
+            }
+            let mut buf = Vec::new();
+            crate::compress::encode_heights(&tile, tile_sample_count, &mut buf);
+            buf
+        })
+        .collect();
+    let samples: Vec<&[u8]> = payloads.iter().step_by(4).map(|p| p.as_slice()).collect();
+    let dict = zstd::dict::from_samples(&samples, 64 * 1024)?;
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(19, &dict)?;
+    compressor.set_parameter(CParameter::ChecksumFlag(false))?;
+    compressor.set_parameter(CParameter::ContentSizeFlag(false))?;
+    compressor.set_parameter(CParameter::DictIdFlag(false))?;
+
+    let mut blob = Vec::new();
+    let mut offsets = vec![0u64]; // keep track of blob offsets for file indexing
+    for payload in payloads.iter() {
+        blob.extend_from_slice(&compressor.compress(payload)?);
+        offsets.push(blob.len() as u64);
+    }
+
+    //let non_dict_compressor = zstd::bulk::Compressor::new(19);
+    //non_dict_compressor.set_parameter(CParameter::ChecksumFlag(false))?;
+    //non_dict_compressor.set_parameter(CParameter::ContentSizeFlag(false))?;
+    //let mut blob_nd = Vec::new();
+    //for payload in payloads.iter() {
+    //    blob_nd.extend_from_slice(&compressor.compress(payload)?);
+    //}
+
+    Ok(())
+}
+
+/// build the height mipmap that is the source dataset
+/// for all data being streamed into the GPU.
+/// Note that this function may crop the source data
+/// in order to ensure that the algorithm can operate
+/// using evenly sized streaming units (tiles)
+fn build_height_mipmap(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    heightmap: &image::DynamicImage,
+    tile_layout: &TileLayout,
+) -> MipChain {
+    let w = tile_layout.size;
+    let luma = image::imageops::crop_imm(&heightmap.to_luma16(), 0, 0, w, w).to_image();
+
+    let bytes: Vec<u8> = luma
+        .pixels()
+        .flat_map(|p| (p.0[0] as u32).to_le_bytes())
+        .collect();
+    let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/mip_height.wgsl"));
+    let mm = MipMapDescriptor {
+        label: None,
+        format: wgpu::TextureFormat::R32Uint,
+        view_formats: &[],
+        source_bytes: &bytes,
+        stride: 4,
+        width: luma.width(),
+        height: luma.height(),
+        count: tile_layout.max_mip + 1,
+    };
+    let mipchain = build(device, queue, &shader, mm);
+    mipchain
+}
+
+pub fn build_height_mipmap_cpu(
+    heightmap: &image::DynamicImage,
+    tile_layout: &TileLayout,
+) -> HeightMips {
+    let luma = heightmap.to_luma16();
+    let n = tile_layout.size as usize;
+    let (src_w, src_h) = (luma.width() as usize, luma.height() as usize);
+    assert!(
+        src_w + 1 >= n && src_h + 1 >= n,
+        "source {src_w}x{src_h} is too small for terrain size {n}"
+    );
+    let src = luma.as_raw();
+
+    let mut level0 = vec![0u16; n * n];
+    level0.par_chunks_mut(n).enumerate().for_each(|(z, row)| {
+        let src_row = &src[z.min(src_h - 1) * src_w..][..src_w];
+        for (x, dst) in row.iter_mut().enumerate() {
+            *dst = src_row[x.min(src_w - 1)];
+        }
+    });
+    drop(luma);
+
+    let mut levels = vec![level0];
+    let mut level_sizes = vec![n as u32];
+    for _ in 1..=tile_layout.max_mip {
+        let prev = levels.last().unwrap();
+        let prev_n = *level_sizes.last().unwrap() as usize;
+        let n = (prev_n - 1) / 2 + 1;
+        let mut level = vec![0u16; n * n];
+        // point decimation: dst[z][x] = prev[2z][2x]
+        level.par_chunks_mut(n).enumerate().for_each(|(z, row)| {
+            let src_row = &prev[2 * z * prev_n..][..prev_n];
+            for (dst, &h) in row.iter_mut().zip(src_row.iter().step_by(2)) {
+                *dst = h;
+            }
+        });
+        levels.push(level);
+        level_sizes.push(n as u32);
+    }
+
+    HeightMips {
+        level_sizes,
+        levels,
+    }
+}
 struct MipMapDescriptor<'a> {
     label: Option<&'a str>,
     format: wgpu::TextureFormat,
@@ -16,7 +215,7 @@ struct MipMapDescriptor<'a> {
     height: u32,
     count: u32,
 }
-
+// ******* unused gpu code
 fn build(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -147,35 +346,7 @@ fn build(
         level_sizes,
     }
 }
-
-/// build the height mipmap that is the source dataset
-/// for all data being streamed into the GPU.
-/// Note that this function may crop the source data
-/// in order to ensure that the algorithm can operate
-/// using evenly sized streaming units (tiles)
-fn build_height_mipmap(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    heightmap: &image::DynamicImage,
-    tile_layout: &TileLayout,
-) -> MipChain {
-    let [w, h] = tile_layout.cropped_size;
-    let luma = image::imageops::crop_imm(&heightmap.to_luma16(), 0, 0, w, h).to_image();
-    let bytes: Vec<u8> = luma
-        .pixels()
-        .flat_map(|p| (p.0[0] as u32).to_le_bytes())
-        .collect();
-    let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/mip_height.wgsl"));
-    let mm = MipMapDescriptor {
-        label: None,
-        format: wgpu::TextureFormat::R32Uint,
-        view_formats: &[],
-        source_bytes: &bytes,
-        stride: 4,
-        width: luma.width(),
-        height: luma.height(),
-        count: tile_layout.max_mip + 1,
-    };
-    let mipchain = build(device, queue, &shader, mm);
-    mipchain
+pub(crate) struct MipChain {
+    pub texture: wgpu::Texture,
+    pub level_sizes: Vec<[u32; 2]>,
 }
