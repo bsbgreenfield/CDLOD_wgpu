@@ -379,19 +379,14 @@ struct SelectedNode {
 struct LevelInfo {
     node_size: u32,
     lod_range: f32,
-    nodes_per_axis: vec2<u32>,
 }
 
 struct BakeValues {
     map_min: vec3<f32>,
     max_mip: u32,
-    map_size: vec3<u32>,
-    tile_size: u32,
-    heightmap_dims: vec2<u32>,
-    root_tiles: vec2<u32>, // always resident
     scale_factors: vec3<f32>, // calculated as scales to convert from sample space to world space
     nodes_per_tile_axis: u32, // must be even
-    min_node_size: u32,
+    root_tiles: vec2<u32>, // always resident
     queue_capacity: u32,
     selected_capacity: u32,
     request_capacity: u32,

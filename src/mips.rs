@@ -1,5 +1,6 @@
-use crate::{CDLODSettings, tiles::TileLayout};
-use image::{ImageBuffer, Luma};
+use std::{io::Write, path::Path};
+
+use crate::tiles::{TileLayout, TileStore};
 use rayon::{
     iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator},
     slice::ParallelSliceMut,
@@ -19,7 +20,7 @@ impl HeightMips {
     }
 }
 
-fn min_max_levels(
+pub(crate) fn min_max_levels(
     mips: &HeightMips,
     node_size: usize,
     lod_count: usize,
@@ -34,8 +35,10 @@ fn min_max_levels(
         .for_each(|(nz, row)| {
             for (nx, mm) in row.iter_mut().enumerate() {
                 let (mut min_h, mut max_h) = (u16::MAX, 0u16);
-                for z in nz * node_size..(nz * node_size + node_size) + 1 {
-                    for &v in &heights[z * level_size + nx * node_size..][..(node_size + 1)] {
+                let node_coords: (usize, usize) = (nx * node_size, nz * node_size);
+                // for each sample within this node
+                for z in node_coords.1..(node_coords.1 + node_size + 1) {
+                    for &v in &heights[z * level_size + node_coords.0..][..(node_size + 1)] {
                         min_h = min_h.min(v);
                         max_h = max_h.max(v);
                     }
@@ -69,9 +72,44 @@ fn min_max_levels(
     (node_count as u32, levels)
 }
 
+pub(crate) fn get_min_max_texture(
+    node_count: u32,
+    levels: Vec<Vec<[u16; 2]>>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> wgpu::Texture {
+    let mm_bytes: Vec<u8> = levels
+        .iter()
+        .flatten()
+        .flat_map(|&[min, max]| [min.to_le_bytes(), max.to_le_bytes()])
+        .flatten()
+        .collect();
+
+    device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("minmax texture"),
+            size: wgpu::Extent3d {
+                width: node_count,
+                height: node_count,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: levels.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg16Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &mm_bytes,
+    )
+}
+
 pub(crate) fn build_compressed_tile_files(
     tile_layout: &TileLayout,
     mips: &HeightMips,
+    tile_path: &Path,
 ) -> std::io::Result<()> {
     let tile_sample_count = (tile_layout.tile_size + 1) as usize;
 
@@ -89,7 +127,7 @@ pub(crate) fn build_compressed_tile_files(
     let payloads: Vec<Vec<u8>> = tile_ids
         .par_iter()
         .map(|&(mip, tile_x, tile_z)| {
-            let x0 = tile_x as usize * tile_sample_count;
+            let x0 = tile_x as usize * tile_layout.tile_size as usize;
             let mut tile =
                 Vec::with_capacity((tile_layout.tile_size * tile_layout.tile_size) as usize);
             for j in 0..tile_sample_count as u32 {
@@ -124,40 +162,29 @@ pub(crate) fn build_compressed_tile_files(
     //    blob_nd.extend_from_slice(&compressor.compress(payload)?);
     //}
 
+    const TILE_FILE_MAGIC: [u8; 4] = *b"CDLT";
+    const TILE_FILE_VERSION: u32 = 1;
+
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(tile_path)?);
+    writer.write_all(&TILE_FILE_MAGIC)?;
+
+    for v in [
+        TILE_FILE_VERSION,
+        tile_sample_count as u32,
+        payloads.len() as u32,
+        dict.len() as u32,
+    ] {
+        writer.write_all(&v.to_le_bytes())?;
+    }
+    writer.write_all(&dict)?;
+
+    for offset in &offsets {
+        writer.write_all(&offset.to_le_bytes())?;
+    }
+    writer.write_all(&blob)?;
+    writer.flush()?;
+
     Ok(())
-}
-
-/// build the height mipmap that is the source dataset
-/// for all data being streamed into the GPU.
-/// Note that this function may crop the source data
-/// in order to ensure that the algorithm can operate
-/// using evenly sized streaming units (tiles)
-fn build_height_mipmap(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    heightmap: &image::DynamicImage,
-    tile_layout: &TileLayout,
-) -> MipChain {
-    let w = tile_layout.size;
-    let luma = image::imageops::crop_imm(&heightmap.to_luma16(), 0, 0, w, w).to_image();
-
-    let bytes: Vec<u8> = luma
-        .pixels()
-        .flat_map(|p| (p.0[0] as u32).to_le_bytes())
-        .collect();
-    let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/mip_height.wgsl"));
-    let mm = MipMapDescriptor {
-        label: None,
-        format: wgpu::TextureFormat::R32Uint,
-        view_formats: &[],
-        source_bytes: &bytes,
-        stride: 4,
-        width: luma.width(),
-        height: luma.height(),
-        count: tile_layout.max_mip + 1,
-    };
-    let mipchain = build(device, queue, &shader, mm);
-    mipchain
 }
 
 pub fn build_height_mipmap_cpu(
@@ -205,6 +232,8 @@ pub fn build_height_mipmap_cpu(
         levels,
     }
 }
+
+// ******* unused gpu code ***************************************
 struct MipMapDescriptor<'a> {
     label: Option<&'a str>,
     format: wgpu::TextureFormat,
@@ -215,7 +244,39 @@ struct MipMapDescriptor<'a> {
     height: u32,
     count: u32,
 }
-// ******* unused gpu code
+
+/// build the height mipmap that is the source dataset
+/// for all data being streamed into the GPU.
+/// Note that this function may crop the source data
+/// in order to ensure that the algorithm can operate
+/// using evenly sized streaming units (tiles)
+fn build_height_mipmap(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    heightmap: &image::DynamicImage,
+    tile_layout: &TileLayout,
+) -> MipChain {
+    let w = tile_layout.size;
+    let luma = image::imageops::crop_imm(&heightmap.to_luma16(), 0, 0, w, w).to_image();
+
+    let bytes: Vec<u8> = luma
+        .pixels()
+        .flat_map(|p| (p.0[0] as u32).to_le_bytes())
+        .collect();
+    let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/mip_height.wgsl"));
+    let mm = MipMapDescriptor {
+        label: None,
+        format: wgpu::TextureFormat::R32Uint,
+        view_formats: &[],
+        source_bytes: &bytes,
+        stride: 4,
+        width: luma.width(),
+        height: luma.height(),
+        count: tile_layout.max_mip + 1,
+    };
+    let mipchain = build(device, queue, &shader, mm);
+    mipchain
+}
 fn build(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

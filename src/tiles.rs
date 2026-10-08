@@ -1,7 +1,9 @@
-use crate::CDLODSettings;
+use crate::{CDLODSettings, MapDimensions};
 
 const MAX_LODS: u32 = 16;
-
+const TILE_FILE_MAGIC: [u8; 4] = *b"CDLT";
+const TILE_FILE_VERSION: u32 = 1;
+const TILE_FILE_HEADER_LEN: usize = 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerrainSize {
     T2,
@@ -25,6 +27,7 @@ impl TerrainSize {
     }
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct TileLayout {
     /// The top mip level which equals the top quad LOD. Contains the root tiles
     pub max_mip: u32,
@@ -40,14 +43,41 @@ pub(crate) struct TileLayout {
     pub size: u32,
 }
 
-struct TileStore {
-    offsets: Vec<u64>,
-    blob: memmap2::Mmap,
-    ddict: zstd::dict::DecoderDictionary<'static>,
-    n: usize,
+pub(crate) struct WorldValues {
+    pub map_min: [f32; 3],       // offset of height samples
+    pub scale_factors: [f32; 3], // xyz scale factors (tile space -> world space)
+    pub lod_ranges: Vec<f32>,
 }
 
-struct TileDecoder<'a> {
+impl WorldValues {
+    pub fn new(settings: &CDLODSettings, layout: &TileLayout) -> Self {
+        let MapDimensions { map_min, size } = settings.map;
+        let intervals = settings.terrain_size.intervals() as f32;
+        let scale_factors = [
+            size[0] / intervals,
+            size[1] / u16::MAX as f32,
+            size[2] / intervals,
+        ];
+
+        let lod_ranges = (0..layout.max_mip + 1)
+            .map(|lod| settings.lod0_range * 2f32.powi(lod as i32))
+            .collect();
+
+        Self {
+            map_min,
+            scale_factors,
+            lod_ranges,
+        }
+    }
+}
+pub(crate) struct TileStore {
+    pub(crate) offsets: Vec<u64>,
+    pub(crate) blob: memmap2::Mmap,
+    pub(crate) ddict: zstd::dict::DecoderDictionary<'static>,
+    pub(crate) n: usize,
+}
+
+pub(crate) struct TileDecoder<'a> {
     decompressor: zstd::bulk::Decompressor<'a>,
     scratch: Vec<u8>, // persistent allocation for moving data
 }
@@ -61,7 +91,7 @@ impl TileStore {
     }
 
     /// tile_index comes straight from RequestList.tiles[]
-    pub fn load(
+    pub(crate) fn load(
         &self,
         dec: &mut TileDecoder,
         tile_index: u32,
@@ -74,9 +104,55 @@ impl TileStore {
         crate::compress::decode_heights(&dec.scratch, self.n, out);
         Ok(())
     }
+    pub(crate) fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        let bad = |msg: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string());
+        let file = std::fs::File::open(path)?;
+        // SAFETY: the tile file must not be modified while it is mapped
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        if map.len() < TILE_FILE_HEADER_LEN || map[..4] != TILE_FILE_MAGIC {
+            return Err(bad("not a tile file"));
+        }
+        let u32_at = |o: usize| u32::from_le_bytes(map[o..o + 4].try_into().unwrap());
+        if u32_at(4) != TILE_FILE_VERSION {
+            return Err(bad("unsupported tile file version"));
+        }
+        let [n, count, dict_len] = [8, 12, 16].map(|o| u32_at(o) as usize);
+
+        let dict_end = TILE_FILE_HEADER_LEN + dict_len;
+        let blob_start = dict_end + (count + 1) * 8;
+        if map.len() < blob_start {
+            return Err(bad("truncated tile file"));
+        }
+        let ddict = zstd::dict::DecoderDictionary::copy(&map[TILE_FILE_HEADER_LEN..dict_end]);
+        // stored relative to the blob; rebase so load() can slice the whole map
+        let offsets: Vec<u64> = map[dict_end..blob_start]
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()) + blob_start as u64)
+            .collect();
+        if offsets[count] as usize > map.len() {
+            return Err(bad("truncated tile file"));
+        }
+        Ok(Self {
+            offsets,
+            blob: map,
+            ddict,
+            n,
+        })
+    }
 }
 
 impl TileLayout {
+    // given a tile index, get the tile
+    pub(crate) fn tile_from_flat(&self, mut index: u32) -> (u32, [u32; 2]) {
+        for mip in (0..self.max_mip + 1).rev() {
+            let [x, z] = self.tiles_per_axis(mip);
+            if index < x * z {
+                return (mip, [index % x, index / x]);
+            }
+            index -= x * z
+        }
+        panic!("tile index out of range");
+    }
     pub fn new(settings: &CDLODSettings, width: u32, height: u32) -> Self {
         let node_size = settings.min_quad_node_size.get();
         let nodes_per_tile_axis = settings.nodes_per_tile_axis.get();
