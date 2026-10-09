@@ -35,6 +35,17 @@ pub(crate) struct LevelInfo {
     _pad: [u32; 2],
 }
 
+#[repr(C)]
+#[derive(Debug, bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+pub(crate) struct IndirectArgs {
+    vertex_count: u32,
+    index_count: u32,
+    instance_count: u32,
+    first_vertex: u32,
+    first_index: u32,
+    first_instance: u32,
+}
+
 pub(crate) struct TileSelector {
     shader: wgpu::ShaderModule,
     bake_values: BakeValues,
@@ -44,6 +55,19 @@ pub(crate) struct TileSelector {
     min_max_heights: wgpu::Texture,
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::PipelineLayout,
+}
+
+fn get_selected_nodes_buffer(device: &wgpu::Device, bake_values: &BakeValues) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("selected nodes"),
+        size: ((size_of::<IndirectArgs>() as usize)
+            + (size_of::<NodeWork>() * bake_values.selected_capacity as usize))
+            as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 fn get_node_work_queue(device: &wgpu::Device, bake_values: BakeValues) -> wgpu::Buffer {
@@ -72,6 +96,32 @@ fn get_node_work_queue(device: &wgpu::Device, bake_values: BakeValues) -> wgpu::
     buf.unmap();
     buf
 }
+
+fn get_levels_buffer(
+    device: &wgpu::Device,
+    layout: &TileLayout,
+    world: &WorldValues,
+    min_quad_node_size: u32,
+) -> wgpu::Buffer {
+    let lod_count = layout.max_mip as usize + 1;
+    assert!(lod_count as u32 <= MAX_LODS);
+
+    let mut levels = [LevelInfo::zeroed(); MAX_LODS as usize]; // unused tail stays zeroed
+    for lod in 0..lod_count {
+        levels[lod] = LevelInfo {
+            node_size: min_quad_node_size << lod, // samples per node axis (sample space)
+            lod_range: world.lod_ranges[lod],     // world-space radius
+            _pad: [0; 2],
+        };
+    }
+
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("levels"),
+        contents: bytemuck::bytes_of(&levels), // 16 * 16 B = 256 B
+        usage: wgpu::BufferUsages::UNIFORM,
+    })
+}
+
 impl TileSelector {
     pub(crate) fn new(
         bake_values: BakeValues,
@@ -89,9 +139,9 @@ impl TileSelector {
             label: Some("tile select pipeline layout"),
             bind_group_layouts: &[
                 Some(&layout.queues),
-                Some(&layout.selection),
+                Some(&layout.camera),
                 Some(&layout.bake),
-                Some(&layout.residency),
+                Some(&layout.state),
             ],
             immediate_size: 0,
         });
@@ -129,7 +179,16 @@ impl TileSelector {
 
 use std::num::NonZeroU64;
 
-use wgpu::wgc::device::queue;
+use bytemuck::Zeroable;
+use wgpu::{
+    util::DeviceExt,
+    wgc::device::{self, queue},
+};
+
+use crate::{
+    ViewUniform, ViewUniformData,
+    tiles::{MAX_LODS, TileLayout, WorldValues},
+};
 
 const CS: wgpu::ShaderStages = wgpu::ShaderStages::COMPUTE;
 
@@ -180,7 +239,7 @@ struct TileSelectorBindGroups {
     residency: wgpu::BindGroup,
 }
 impl TileSelectorBindGroups {
-    fn get_queues_bg(
+    fn create_queues_bg(
         in_q: &wgpu::Buffer,
         out_q: &wgpu::Buffer,
         device: &wgpu::Device,
@@ -199,7 +258,7 @@ impl TileSelectorBindGroups {
                     }),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 0,
+                    binding: 1,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: out_q,
                         offset: 0,
@@ -211,47 +270,146 @@ impl TileSelectorBindGroups {
 
         bg
     }
+
+    fn create_camera_bg(
+        view_uniform: &ViewUniform,
+        layout: &wgpu::BindGroupLayout,
+        device: &wgpu::Device,
+    ) -> wgpu::BindGroup {
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera bg"),
+            layout: layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &view_uniform.buf,
+                    offset: 0,
+                    size: None,
+                }),
+            }],
+        });
+
+        bg
+    }
+
+    fn create_bake_bg(
+        min_max_texture_view: &wgpu::TextureView,
+        bake_values_buffer: &wgpu::Buffer,
+        levels_buffer: &wgpu::Buffer,
+        layout: &wgpu::BindGroupLayout,
+        device: &wgpu::Device,
+    ) -> wgpu::BindGroup {
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bake bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(min_max_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: bake_values_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: levels_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        });
+
+        bg
+    }
+
+    fn create_state_bg(
+        selected_nodes_buffer: &wgpu::Buffer,
+        residency_view: &wgpu::TextureView,
+        request_flags_buffer: &wgpu::Buffer,
+        request_list_buffer: &wgpu::Buffer,
+        layout: &wgpu::BindGroupLayout,
+        device: &wgpu::Device,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("state bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: selected_nodes_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(residency_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: request_flags_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: request_list_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        })
+    }
 }
 pub(crate) struct TileSelectorLayouts {
-    pub queues: wgpu::BindGroupLayout,    // group 0
-    pub selection: wgpu::BindGroupLayout, // group 1
-    pub bake: wgpu::BindGroupLayout,      // group 2
-    pub residency: wgpu::BindGroupLayout, // group 3
+    pub queues: wgpu::BindGroupLayout, // group 0
+    pub camera: wgpu::BindGroupLayout, // group 1
+    pub bake: wgpu::BindGroupLayout,   // group 2
+    pub state: wgpu::BindGroupLayout,  // group 3
 }
 
 fn create_layouts(device: &wgpu::Device) -> TileSelectorLayouts {
-    let mk = |label, entries: &[wgpu::BindGroupLayoutEntry]| {
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(label),
-            entries,
-        })
-    };
     TileSelectorLayouts {
         // in_queue (ro), out_queue (rw). Binding 1 is unused, matching the shader.
-        queues: mk("ts queues", &[storage(0, true), storage(2, false)]),
-        // selected_nodes, frustum, camera, draw_args
-        selection: mk(
-            "ts selection",
-            &[
-                storage(0, false),
-                uniform(1, None),
-                uniform(2, None),
-                storage(3, false),
-            ],
-        ),
+        queues: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("queues"),
+            entries: &[storage(0, true), storage(1, false)],
+        }),
+        camera: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("camera"),
+            entries: &[uniform(0, None)],
+        }),
         // min_max_heights, bake_values, levels (16 * 16 B)
-        bake: mk(
-            "ts bake",
-            &[
+        bake: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bake"),
+            entries: &[
                 uint_texture(0),
                 uniform(1, Some(size_of::<BakeValues>() as u64)),
                 uniform(2, Some(16 * 16)),
             ],
-        ),
+        }),
         // residency, request_flags, requests
-        residency: mk(
-            "ts residency",
-            &[uint_texture(0), storage(1, false), storage(2, false)],
-        ),
+        state: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shared state"),
+            entries: &[
+                storage(0, false),
+                storage(1, false),
+                uint_texture(2),
+                storage(3, false),
+                storage(4, false),
+            ],
+        }),
     }
 }

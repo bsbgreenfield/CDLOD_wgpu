@@ -10,7 +10,7 @@ use crate::{
         build_compressed_tile_files, build_height_mipmap_cpu, get_min_max_texture, min_max_levels,
     },
     stream::{GPUTerrainData, StreamConfig, TileStreamer},
-    tile_selector::BakeValues,
+    tile_selector::{BakeValues, TileSelector},
     tiles::{TerrainSize, TileLayout, TileStore, WorldValues},
 };
 
@@ -21,23 +21,60 @@ mod stream;
 mod tile_selector;
 mod tiles;
 
+pub struct ViewProjection {
+    pub view_proj: [[f32; 4]; 4],
+    pub position: [f32; 3],
+    pub frustum_planes: [[f32; 4]; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ViewUniformData {
+    view_proj: [[f32; 4]; 4],
+    frustum_planes: [[f32; 4]; 6],
+    position: [f32; 3],
+    _pad: f32,
+}
+
+struct ViewUniform {
+    bg: wgpu::BindGroup,
+    buf: wgpu::Buffer,
+}
+
 pub struct Terrain {
     tile_streamer: TileStreamer,
     gpu_terrain_data: GPUTerrainData,
     min_max_texture: wgpu::Texture,
+    tile_selector: TileSelector,
+    view_uniform: ViewUniform,
     world: WorldValues,
 }
 
 impl Terrain {
+    //let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    //    label: Some("camera buffer"),
+    //    contents: bytemuck::bytes_of(view),
+    //    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+    //});
+    fn update_view(&self, view: &ViewProjection, queue: &wgpu::Queue) {
+        let data = ViewUniformData {
+            view_proj: view.view_proj,
+            frustum_planes: view.frustum_planes,
+            position: view.position,
+            _pad: 0.0,
+        };
+
+        queue.write_buffer(&self.view_uniform.buf, 0, bytemuck::bytes_of(&data));
+    }
     fn tile_select(&mut self) {
 
         //todo
     }
-    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, camera_pos: [f32; 3]) {
+    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, view: &ViewProjection) {
         self.tile_streamer.update(
             device,
             queue,
-            camera_pos,
+            view.position,
             &self.gpu_terrain_data,
             &self.world,
         );
@@ -91,6 +128,8 @@ pub fn load_terrain(
         gpu_terrain_data,
         min_max_texture,
         world,
+        tile_selector: todo!(),
+        view_uniform: todo!(),
     })
 }
 

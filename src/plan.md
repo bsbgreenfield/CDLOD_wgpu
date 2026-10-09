@@ -375,6 +375,13 @@ struct SelectedNode {
     xz: u32, 
     meta: u32, // lod | tile_slot
 }
+struct SelectedNodes {
+    vertex_count:   u32,
+    instance_count: atomic<u32>,   // still at offset 4
+    first_vertex:   u32,
+    first_instance: u32,
+    nodes:          array<SelectedNode>,
+}
 
 struct LevelInfo {
     node_size: u32,
@@ -410,20 +417,18 @@ const WG_SIZE: u32 = 64u;
 const MAX_LODS = 16u;
 
 @group(0) @binding(0) var<storage, read>       in_queue:   InQueue; // dispatch args for this dispatch  + scratch space
-@group(0) @binding(2) var<storage, read_write> out_queue:  OutQueue;  // next level's args
+@group(0) @binding(1) var<storage, read_write> out_queue:  OutQueue;  // next level's args
 
-@group(1) @binding(0) var<storage, read_write> selected_nodes:  array<SelectedNode>;
-@group(1) @binding(1) var<uniform>             frustum:         Frustum;
-@group(1) @binding(2) var<uniform>             camera:          Camera;
-@group(1) @binding(3) var<storage, read_write> draw_args:       RenderIndirectArgs;
+@group(1) @binding(1) var<uniform>             camera:          Camera;
 
 @group(2) @binding(0) var                      min_max_heights: texture_2d<u32>; // mipmap of height vals 
 @group(2) @binding(1) var<uniform>             bake_values:     BakeValues;
 @group(2) @binding(2) var<uniform>             levels:          array<LevelInfo, MAX_LODS>;
 
-@group(3) @binding(0) var                      residency:       texture_2d<u32>; // residency array for tiles
-@group(3) @binding(1) var<storage, read_write> request_flags:   array<atomic<u32>>;
-@group(3) @binding(2) var<storage, read_write> requests:        RequestList;        
+@group(3) @binding(0) var<storage, read_write> selected_nodes:  array<SelectedNodes>;
+@group(3) @binding(1) var                      residency:       texture_2d<u32>; // residency array for tiles
+@group(3) @binding(2) var<storage, read_write> request_flags:   array<atomic<u32>>;
+@group(3) @binding(3) var<storage, read_write> requests:        RequestList;        
 
 
 fn frustum_intersects(aabb: AABB) -> bool {

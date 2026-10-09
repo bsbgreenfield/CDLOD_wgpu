@@ -1,6 +1,6 @@
 use crate::{CDLODSettings, MapDimensions};
 
-const MAX_LODS: u32 = 16;
+pub const MAX_LODS: u32 = 16;
 const TILE_FILE_MAGIC: [u8; 4] = *b"CDLT";
 const TILE_FILE_VERSION: u32 = 1;
 const TILE_FILE_HEADER_LEN: usize = 20;
