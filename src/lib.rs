@@ -44,7 +44,6 @@ struct ViewUniform {
 pub struct Terrain {
     tile_streamer: TileStreamer,
     gpu_terrain_data: GPUTerrainData,
-    min_max_texture: wgpu::Texture,
     tile_selector: TileSelector,
     view_uniform: ViewUniform,
     world: WorldValues,
@@ -122,14 +121,28 @@ pub fn load_terrain(
         request_capacity: request_capacity,
         _pad: [0, 0, 0],
     };
+    let view_uniform = ViewUniform {
+        bg: todo!(),
+        buf: todo!(),
+    };
+    let tile_selector = TileSelector::new(
+        bake_values,
+        min_max_texture,
+        device,
+        queue,
+        &settings,
+        &tile_layout,
+        &gpu_terrain_data,
+        &world,
+        &view_uniform,
+    );
 
     Ok(Terrain {
         tile_streamer: streamer,
         gpu_terrain_data,
-        min_max_texture,
         world,
         tile_selector: todo!(),
-        view_uniform: todo!(),
+        view_uniform: view_uniform,
     })
 }
 

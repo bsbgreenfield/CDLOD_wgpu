@@ -55,9 +55,11 @@ pub(crate) struct TileStreamer {
 pub(crate) struct GPUTerrainData {
     /// the gpu resident heightmap texture
     pub atlas: wgpu::Texture,
+    pub atlas_view: wgpu::TextureView,
 
     /// tile -> slot map
     pub residency: wgpu::Texture,
+    pub residency_view: wgpu::TextureView,
 
     /// residency markers for compute shader request dedup
     pub request_flags: wgpu::Buffer,
@@ -140,7 +142,32 @@ impl GPUTerrainData {
             })
             .collect();
 
+        let atlas_view = atlas.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("atlas text view"),
+            format: Some(wgpu::TextureFormat::R16Uint),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            usage: Some(wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST),
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: None,
+            base_array_layer: 0,
+            array_layer_count: None,
+        });
+        let residency_view = residency.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("res tex view"),
+            format: Some(wgpu::TextureFormat::R16Uint),
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            usage: Some(wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST),
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: None,
+            base_array_layer: 0,
+            array_layer_count: None,
+        });
+
         Self {
+            atlas_view,
+            residency_view,
             atlas,
             residency,
             request_flags,

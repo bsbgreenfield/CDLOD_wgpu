@@ -124,6 +124,17 @@ When converting from QuadNode -> world space AABB to perform the selection, such
 we are also converting from **heightmap space** into **world space**.
 
 
+***IMPORTANT CONSTRAINT ******
+The number of LODs are generated based on the values provided by the user of 
+1. min quad node size
+2. nodes per tile axis
+3. max_LOD
+4. terrain size
+
+It is alway true that the number of LODs will equal the number of mips in the terrain dataset, because
+nodes will not be created that would require data which is finer than the source dataset or that would
+sample at a lower frequency than the highest mip level requested by the user (or the max lod level allowed)
+
 
 ### DATA STORAGE AND TILE MIPMAPS
 
@@ -157,13 +168,15 @@ Either way, there will be a max mip at which we can say the tile/tiles that span
 have the useful property of being the ancestors of all other tiles. We ensure that these root tiles are always resident
 
 
+
 #### source cropping
 An invariant of this algorithm that must be upheld is that each mip level contains a whole number of tiles,
 and that each node has exactly one tile as its data source. This requirement makes the code simpler and allows use of the
 compute shader to request new tiles, because we can simultaneously check for child node data residency and request that tile 
 to become resident if not in the same pass. The side effect of this is that the algorithm doesnt necessarily work for 
 every shape of source data. Specifically, the source data must be subdivisable into a whole number of tiles.
-Therefore, we crop the source data if this isnt possible
+Therefore, we crop the source data if this isnt possible, or add padding.
+
 
 #### tile creation
 Recall the inverted pyramid: to create our tile subdivisions we can iterate from base to peak.
@@ -177,23 +190,6 @@ Next, at the layer above (layer 1), we split the layer into 4 tiles, such that e
 This goes on until the peak of the pyramid, in which the number of tiles is equal to the number of nodes at the finest level of granularity divided by R.
 
 Tiles are defined as containing T+1 X T+1 samples, rather than T X T, to provide deliberate row and column overlap between tiles, for morphs (discussed later)
-
-Some properties of this system are as follows
-1. The tile level, or mipmap level, selected for a given node at LOD L is min(L, maxMipLevel)
-- This is a clamp on the LODOffset value, briefly mentioned above as deriving from the fact that we only create as many mip layers as required to reach the root tile.
-So there may be 8 subdivision layers of quad nodes (quad LOD levels) but only 5 levels of the mipmap, so for nodes 8, 7, 6, and 5, the mipmap level is equal to 5.
-
-2. Tile Sample Span per mip level is T * 2^mipLevel, or T << tileLevel. Where T is the number of samples in each tile axis
-- it can be seen that as the mip level increases, meaning coarser, or as we approach the root tile, the span in **heightmap space** increases
-
-3. the tile X offset within a  given mip level is equal to nodeX / tileSpan
-- we can easily calculate the offset of a selected tile within by dividing the node offset, in heightmap space, by the tileSpan in heighmap space
-This x offset can be thought of as the offset in **mip space**
-
-4. tile stride is equal to 1 * 2^(nodeLevel - tileLevel)
-- For the levels below LODOffset, in which the node level and tile level agree, the stride in sample units for the tile vs the node can be thought of as 1:1 with the source dataset.
-For the higher levels, in which nodeLevel > tileLevel, the selected tile contains logical nodes which are wider in span than the actual selected node.
-We account for this by sampling within the tile at a lower rate (coarser) than the nodeLevel would otherwise suggest, in the shader
 
 
 
@@ -215,6 +211,7 @@ direction of the camera. and we may be able to replace pessimestic ancestor load
 In practice, we avoid (or bypass) the issue of trying to render a node whose desired mip level tile is not resident by simply stopping node subdivision when we reach
 a level for which there is no resident tile at the next level of detail. So in other words, we use the coarser tile than its distance from the camera would otherwise suggest.
 This has the (slight) added benefit of reducing the work for the algorithm in the most throughput throttled times (i.e. fast moving camera)
+
 
 
 
