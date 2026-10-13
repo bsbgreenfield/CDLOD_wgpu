@@ -1,4 +1,4 @@
-use crate::{CDLODSettings, MapDimensions};
+use crate::{CDLODSettings, MapDimensions, ViewProjection};
 
 pub const MAX_LODS: u32 = 16;
 const TILE_FILE_MAGIC: [u8; 4] = *b"CDLT";
@@ -41,6 +41,31 @@ pub(crate) struct TileLayout {
 
     /// the source size in samples after cropping
     pub size: u32,
+}
+
+pub(crate) fn selected_capacity(
+    lod0_range: f32,
+    min_quad_node_size: u32,
+    scale_x: f32, // world.scale_factors[0]
+    view_proj: &ViewProjection,
+    lod_count: u32,
+) -> u32 {
+    let (fov_y, aspect) = view_proj.fov_and_aspect();
+    use std::f32::consts::{PI, SQRT_2};
+    let k = lod0_range / (min_quad_node_size as f32 * scale_x);
+
+    let outer = k + 3.0 * SQRT_2;
+    let inner = (k * 0.5 - SQRT_2).max(0.0);
+    let ring = PI * (outer * outer - inner * inner);
+
+    // diagonal FOV: a pitched camera's ground footprint is wider than its horizontal FOV
+    let half_diag = ((fov_y * 0.5).tan() * (1.0 + aspect * aspect).sqrt()).atan();
+    let frac = (2.0 * half_diag / (2.0 * PI)).min(1.0);
+    let edges = 2.0 * 2.0 * (outer + 1.0);
+
+    let per_lod = (frac * ring + edges).min(ring);
+    let safety = 2.0; // looking steeply down covers more azimuth than the FOV wedge
+    ((per_lod * lod_count as f32 * safety) as u32).next_power_of_two()
 }
 
 pub(crate) struct WorldValues {

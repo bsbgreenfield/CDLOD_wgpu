@@ -5,6 +5,8 @@ use std::{
     sync::Arc,
 };
 
+use wgpu::util::DeviceExt;
+
 use crate::{
     mips::{
         build_compressed_tile_files, build_height_mipmap_cpu, get_min_max_texture, min_max_levels,
@@ -26,6 +28,16 @@ pub struct ViewProjection {
     pub position: [f32; 3],
     pub frustum_planes: [[f32; 4]; 6],
 }
+impl ViewProjection {
+    pub(crate) fn fov_and_aspect(&self) -> (f32, f32) {
+        let m = &self.view_proj; // column-major: m[col][row]
+        let row_len = |r: usize| (m[0][r] * m[0][r] + m[1][r] * m[1][r] + m[2][r] * m[2][r]).sqrt();
+        let f = row_len(1);
+        let fov_y = 2.0 * (1.0 / f).atan();
+        let aspect = f / row_len(0);
+        (fov_y, aspect)
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -37,8 +49,24 @@ pub struct ViewUniformData {
 }
 
 struct ViewUniform {
-    bg: wgpu::BindGroup,
     buf: wgpu::Buffer,
+}
+
+impl ViewUniform {
+    fn new(device: &wgpu::Device, view_proj: &ViewProjection) -> Self {
+        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("view uniform"),
+            contents: bytemuck::bytes_of(&ViewUniformData {
+                view_proj: view_proj.view_proj,
+                frustum_planes: view_proj.frustum_planes,
+                position: view_proj.position,
+                _pad: 0.0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        Self { buf }
+    }
 }
 
 pub struct Terrain {
@@ -50,26 +78,8 @@ pub struct Terrain {
 }
 
 impl Terrain {
-    //let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-    //    label: Some("camera buffer"),
-    //    contents: bytemuck::bytes_of(view),
-    //    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
-    //});
-    fn update_view(&self, view: &ViewProjection, queue: &wgpu::Queue) {
-        let data = ViewUniformData {
-            view_proj: view.view_proj,
-            frustum_planes: view.frustum_planes,
-            position: view.position,
-            _pad: 0.0,
-        };
-
-        queue.write_buffer(&self.view_uniform.buf, 0, bytemuck::bytes_of(&data));
-    }
-    fn tile_select(&mut self) {
-
-        //todo
-    }
-    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, view: &ViewProjection) {
+    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, view: &ViewUniformData) {
+        queue.write_buffer(&self.view_uniform.buf, 0, bytemuck::bytes_of(view));
         self.tile_streamer.update(
             device,
             queue,
@@ -77,6 +87,10 @@ impl Terrain {
             &self.gpu_terrain_data,
             &self.world,
         );
+        let mut encoder = device.create_command_encoder(&wgpu::wgt::CommandEncoderDescriptor {
+            label: Some("encoder"),
+        });
+        self.tile_selector.select_tiles(&mut encoder);
     }
 }
 
@@ -84,6 +98,7 @@ pub fn load_terrain(
     height_path: PathBuf,
     diffuse_path: PathBuf,
     tile_path: &Path,
+    view_proj: &ViewProjection,
     settings: CDLODSettings,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -97,7 +112,6 @@ pub fn load_terrain(
     let world = WorldValues::new(&settings, &tile_layout);
 
     let request_capacity = stream_config.request_capacity;
-    let max_inflight = stream_config.max_inflight;
     let height_mips = build_height_mipmap_cpu(&heightmap, &tile_layout);
     build_compressed_tile_files(&tile_layout, &height_mips, tile_path)?;
     let store = Arc::new(TileStore::open(tile_path)?);
@@ -110,26 +124,35 @@ pub fn load_terrain(
     );
     let min_max_texture = get_min_max_texture(node_count, mm_levels, device, queue);
 
+    let k =
+        settings.lod0_range / (settings.min_quad_node_size.get() as f32 * world.scale_factors[0]);
+    let disc = std::f32::consts::PI * (k + 3.0 * std::f32::consts::SQRT_2).powi(2);
+    let queue_capacity = (tile_layout.root_tiles[0] * tile_layout.root_tiles[1])
+        .max((disc * 2.0) as u32)
+        .next_power_of_two();
+
     let bake_values = BakeValues {
         map_min: settings.map.map_min,
         max_mip: tile_layout.max_mip,
         root_tiles: tile_layout.root_tiles,
         scale_factors: world.scale_factors,
         nodes_per_tile_axis: tile_layout.nodes_per_tile_axis,
-        queue_capacity: max_inflight as u32,
-        selected_capacity: max_inflight as u32,
+        queue_capacity: queue_capacity,
+        selected_capacity: tiles::selected_capacity(
+            settings.lod0_range,
+            settings.min_quad_node_size.get(),
+            world.scale_factors[0],
+            view_proj,
+            tile_layout.max_mip,
+        ),
         request_capacity: request_capacity,
         _pad: [0, 0, 0],
     };
-    let view_uniform = ViewUniform {
-        bg: todo!(),
-        buf: todo!(),
-    };
+    let view_uniform = ViewUniform::new(device, view_proj);
     let tile_selector = TileSelector::new(
         bake_values,
         min_max_texture,
         device,
-        queue,
         &settings,
         &tile_layout,
         &gpu_terrain_data,
@@ -141,7 +164,7 @@ pub fn load_terrain(
         tile_streamer: streamer,
         gpu_terrain_data,
         world,
-        tile_selector: todo!(),
+        tile_selector,
         view_uniform: view_uniform,
     })
 }
