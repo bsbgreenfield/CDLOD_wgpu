@@ -76,7 +76,7 @@ impl GPUTerrainData {
         layout: &TileLayout,
         config: &StreamConfig,
     ) -> Self {
-        let n = layout.tile_size + 1;
+        let n = layout.stored_tile_size();
         let tile_count = layout.tile_count() as usize;
 
         let atlas = device.create_texture(&wgpu::TextureDescriptor {
@@ -442,7 +442,7 @@ impl TileStreamer {
         atlas: &wgpu::Texture,
         residency: &wgpu::Texture,
     ) {
-        let n = self.layout.tile_size + 1;
+        let n = self.layout.stored_tile_size();
         let s = slot as u32;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {

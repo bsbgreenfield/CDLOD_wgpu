@@ -111,7 +111,8 @@ pub(crate) fn build_compressed_tile_files(
     mips: &HeightMips,
     tile_path: &Path,
 ) -> std::io::Result<()> {
-    let tile_sample_count = (tile_layout.tile_size + 1) as usize;
+    let tile_sample_count = tile_layout.stored_tile_size() as usize;
+    let gutter = crate::tiles::TILE_GUTTER as i64;
 
     let mut tile_ids: Vec<(u32, u32, u32)> = Vec::new();
     let mip_count = tile_layout.max_mip + 1;
@@ -127,12 +128,15 @@ pub(crate) fn build_compressed_tile_files(
     let payloads: Vec<Vec<u8>> = tile_ids
         .par_iter()
         .map(|&(mip, tile_x, tile_z)| {
-            let x0 = tile_x as usize * tile_layout.tile_size as usize;
-            let mut tile =
-                Vec::with_capacity((tile_layout.tile_size * tile_layout.tile_size) as usize);
-            for j in 0..tile_sample_count as u32 {
-                tile.extend_from_slice(
-                    &mips.row(mip, tile_z * tile_layout.tile_size + j)[x0..x0 + tile_sample_count],
+            let last = mips.level_sizes[mip as usize] as i64 - 1;
+            let x0 = (tile_x * tile_layout.tile_size) as i64 - gutter;
+            let z0 = (tile_z * tile_layout.tile_size) as i64 - gutter;
+            let mut tile = Vec::with_capacity(tile_sample_count * tile_sample_count);
+            for j in 0..tile_sample_count as i64 {
+                // gutter samples past the map edge clamp to the edge
+                let row = mips.row(mip, (z0 + j).clamp(0, last) as u32);
+                tile.extend(
+                    (0..tile_sample_count as i64).map(|i| row[(x0 + i).clamp(0, last) as usize]),
                 );
             }
             let mut buf = Vec::new();

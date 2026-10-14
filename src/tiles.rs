@@ -1,6 +1,7 @@
 use crate::{CDLODSettings, MapDimensions, ViewProjection};
 
 pub const MAX_LODS: u32 = 16;
+pub const TILE_GUTTER: u32 = 1;
 const TILE_FILE_MAGIC: [u8; 4] = *b"CDLT";
 const TILE_FILE_VERSION: u32 = 1;
 const TILE_FILE_HEADER_LEN: usize = 20;
@@ -217,6 +218,10 @@ impl TileLayout {
             size: settings.terrain_size.samples(),
         };
         layout
+    }
+
+    pub(crate) fn stored_tile_size(&self) -> u32 {
+        self.tile_size + 1 + (2 * TILE_GUTTER)
     }
 
     pub(crate) fn tiles_per_axis(&self, mip: u32) -> [u32; 2] {

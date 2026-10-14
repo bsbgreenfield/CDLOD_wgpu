@@ -21,15 +21,6 @@ struct LODArgsOut {
     count: atomic<u32>,
 }
 
-struct RenderIndirectArgs {
-    index_count: u32, 
-    instance_count: atomic<u32>,
-    first_index: u32,
-    base_vertex: i32,
-    first_instance: u32,
-
-}
-
 struct Camera {
     view_proj: mat4x4<f32>,
     frustum_planes: array<vec4<f32>, 6>,
@@ -51,9 +42,10 @@ struct SelectedNode {
     info: u32, // lod | tile_slot
 }
 struct SelectedNodes {
-    vertex_count:   u32,
-    instance_count: atomic<u32>,   // still at offset 4
-    first_vertex:   u32,
+    index_count: u32, 
+    instance_count: atomic<u32>,
+    first_index: u32,
+    base_vertex: i32,
     first_instance: u32,
     nodes:          array<SelectedNode>,
 }
@@ -239,11 +231,11 @@ fn select_nodes_for_level(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 
     // get the instance idx for the selected node, increment for next
-    let i = atomicAdd(&draw_args.instance_count, 1u); 
+    let i = atomicAdd(&selected_nodes.instance_count, 1u); 
 
     if (i >= bake_values.selected_capacity) {return;} // gaurd against selected node buf overflow
 
-    selected_nodes[i] = SelectedNode(node_work.xz, (lod<<16u) | tile_slot); // lod | slot 
+    selected_nodes.nodes[i] = SelectedNode(node_work.xz, (lod<<16u) | tile_slot); // lod | slot 
 
 }
 
@@ -259,7 +251,7 @@ fn reset_out_queue() {
 // runs after the last level: overflowing selects still bumped the count
 @compute @workgroup_size(1)
 fn clamp_selected() {
-    let n = atomicLoad(&selected.instance_count);
-    atomicStore(&selected.instance_count, min(n, bake_values.selected_capacity));
+    let n = atomicLoad(&selected_nodes.instance_count);
+    atomicStore(&selected_nodes.instance_count, min(n, bake_values.selected_capacity));
 }
 

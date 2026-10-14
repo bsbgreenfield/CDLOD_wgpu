@@ -35,37 +35,51 @@ pub(crate) struct LevelInfo {
     _pad: [u32; 2],
 }
 
-pub(crate) struct TileSelector {
-    shader: wgpu::ShaderModule,
+pub(crate) struct NodeSelector {
     bake_values: BakeValues,
     node_queue_a: wgpu::Buffer,
     node_queue_b: wgpu::Buffer,
     root_queue: wgpu::Buffer,
-    min_max_heights: wgpu::Texture,
-    min_max_tex_view: wgpu::TextureView,
     select_pipeline: wgpu::ComputePipeline,
     reset_pipeline: wgpu::ComputePipeline,
     clamp_pipeline: wgpu::ComputePipeline,
-    pipeline_layout: wgpu::PipelineLayout,
-    bind_groups: TileSelectorBindGroups,
+    pub(crate) bind_groups: NodeSelectorBindGroups,
 }
 
-fn get_selected_nodes_buffer(device: &wgpu::Device, bake_values: &BakeValues) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
+pub(crate) fn get_selected_nodes_buffer(
+    device: &wgpu::Device,
+    bake_values: &BakeValues,
+    node_size: u32,
+) -> wgpu::Buffer {
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("selected nodes"),
         size: ((size_of::<wgpu::wgt::DrawIndexedIndirectArgs>() as usize)
             + (size_of::<NodeWork>() * bake_values.selected_capacity as usize))
             as u64,
         usage: wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::INDIRECT
-            | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: true,
+    });
+
+    buf.slice(..size_of::<wgpu::wgt::DrawIndexedIndirectArgs>() as u64)
+        .get_mapped_range_mut()
+        .unwrap()
+        .copy_from_slice(bytemuck::bytes_of(&wgpu::wgt::DrawIndexedIndirectArgs {
+            index_count: (node_size.pow(2) * 6),
+            instance_count: 0,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        }));
+    buf.unmap();
+    buf
 }
 
 fn get_node_work_queue(device: &wgpu::Device, bake_values: BakeValues) -> wgpu::Buffer {
-    let size = (size_of::<LODArgs>()
-        + bake_values.selected_capacity as usize * size_of::<NodeWork>()) as u64;
+    let size =
+        (size_of::<LODArgs>() + bake_values.queue_capacity as usize * size_of::<NodeWork>()) as u64;
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("tile select queue"),
         size,
@@ -94,12 +108,12 @@ fn get_root_work_queue(device: &wgpu::Device, tile_layout: &TileLayout) -> wgpu:
     let roots_per_axis = tile_layout.root_tiles[0] * tile_layout.nodes_per_tile_axis;
     let roots: Vec<NodeWork> = (0..roots_per_axis * roots_per_axis)
         .map(|i| NodeWork {
-            xz: (i % roots_per_axis) << MAX_LODS | (i / roots_per_axis),
+            xz: (i % roots_per_axis) << 16 | (i / roots_per_axis),
             lod: tile_layout.max_mip,
         })
         .collect();
     let args = LODArgs {
-        wg_x: roots_per_axis.pow(2).div_ceil(MAX_LODS * 4),
+        wg_x: roots_per_axis.pow(2).div_ceil(16 * 4),
         wg_y: 1,
         wg_z: 1,
         count: roots_per_axis.pow(2),
@@ -122,6 +136,7 @@ fn get_root_work_queue(device: &wgpu::Device, tile_layout: &TileLayout) -> wgpu:
         .get_mapped_range_mut()
         .unwrap()
         .copy_from_slice(bytemuck::cast_slice(&roots));
+    buf.unmap();
     buf
 }
 
@@ -158,7 +173,7 @@ fn get_levels_buffer(
     })
 }
 
-impl TileSelector {
+impl NodeSelector {
     pub(crate) fn new(
         bake_values: BakeValues,
         min_max_heights: wgpu::Texture,
@@ -226,7 +241,7 @@ impl TileSelector {
             array_layer_count: None,
         });
 
-        let bind_groups = TileSelectorBindGroups::new(
+        let bind_groups = NodeSelectorBindGroups::new(
             device,
             settings,
             tile_layout,
@@ -241,26 +256,22 @@ impl TileSelector {
             &layout,
         );
         Self {
-            shader,
             bake_values,
             node_queue_a,
             node_queue_b,
             root_queue,
-            min_max_heights,
-            min_max_tex_view,
             bind_groups,
             select_pipeline,
             reset_pipeline,
             clamp_pipeline,
-            pipeline_layout,
         }
     }
-    pub(crate) fn select_tiles(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub(crate) fn select_nodes(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.clear_buffer(&self.bind_groups.selected_nodes_buffer, 4, Some(4));
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_bind_group(1, &self.bind_groups.camera, &[]);
         pass.set_bind_group(2, &self.bind_groups.bake, &[]);
-        pass.set_bind_group(2, &self.bind_groups.state, &[]);
+        pass.set_bind_group(3, &self.bind_groups.state, &[]);
 
         // intial max lod pass, reset, then fill queue a
         pass.set_bind_group(0, &self.bind_groups.root_queue_bg, &[]);
@@ -292,13 +303,10 @@ impl TileSelector {
 use std::num::NonZeroU64;
 
 use bytemuck::Zeroable;
-use wgpu::{
-    util::DeviceExt,
-    wgc::device::{self, queue},
-};
+use wgpu::util::DeviceExt;
 
 use crate::{
-    CDLODSettings, ViewUniform, ViewUniformData,
+    CDLODSettings, ViewUniform,
     stream::GPUTerrainData,
     tiles::{MAX_LODS, TileLayout, WorldValues},
 };
@@ -345,24 +353,24 @@ fn uint_texture(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-pub(crate) struct TileSelectorLayouts {
+pub(crate) struct NodeSelectorLayouts {
     pub queues: wgpu::BindGroupLayout, // group 0
     pub camera: wgpu::BindGroupLayout, // group 1
     pub bake: wgpu::BindGroupLayout,   // group 2
     pub state: wgpu::BindGroupLayout,  // group 3
 }
-struct TileSelectorBindGroups {
+pub(crate) struct NodeSelectorBindGroups {
     levels_buffer: wgpu::Buffer,
     bake_values_buffer: wgpu::Buffer,
-    selected_nodes_buffer: wgpu::Buffer,
+    pub(crate) selected_nodes_buffer: wgpu::Buffer,
     queue_a_bg: wgpu::BindGroup,
     queue_b_bg: wgpu::BindGroup,
     root_queue_bg: wgpu::BindGroup,
-    camera: wgpu::BindGroup,
-    bake: wgpu::BindGroup,
-    state: wgpu::BindGroup,
+    pub(crate) camera: wgpu::BindGroup,
+    pub(crate) bake: wgpu::BindGroup,
+    pub(crate) state: wgpu::BindGroup,
 }
-impl TileSelectorBindGroups {
+impl NodeSelectorBindGroups {
     fn new(
         device: &wgpu::Device,
         settings: &CDLODSettings,
@@ -375,7 +383,7 @@ impl TileSelectorBindGroups {
         root_queue: &wgpu::Buffer,
         view_uniform: &ViewUniform,
         min_max_texture_view: &wgpu::TextureView,
-        layouts: &TileSelectorLayouts,
+        layouts: &NodeSelectorLayouts,
     ) -> Self {
         let queue_a_bg = Self::create_queues_bg(queue_a, queue_b, device, &layouts.queues);
         let queue_b_bg = Self::create_queues_bg(queue_b, queue_a, device, &layouts.queues);
@@ -396,7 +404,8 @@ impl TileSelectorBindGroups {
             &layouts.bake,
             device,
         );
-        let selected_nodes_buffer = get_selected_nodes_buffer(device, &bake_values);
+        let selected_nodes_buffer =
+            get_selected_nodes_buffer(device, &bake_values, settings.min_quad_node_size.get());
         let state = Self::create_state_bg(
             &selected_nodes_buffer,
             &gpu_terrain_data.residency_view,
@@ -553,8 +562,8 @@ impl TileSelectorBindGroups {
     }
 }
 
-fn create_layouts(device: &wgpu::Device) -> TileSelectorLayouts {
-    TileSelectorLayouts {
+fn create_layouts(device: &wgpu::Device) -> NodeSelectorLayouts {
+    NodeSelectorLayouts {
         // in_queue (ro), out_queue (rw). Binding 1 is unused, matching the shader.
         queues: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("queues"),

@@ -11,16 +11,18 @@ use crate::{
     mips::{
         build_compressed_tile_files, build_height_mipmap_cpu, get_min_max_texture, min_max_levels,
     },
+    node_selector::{BakeValues, NodeSelector},
     stream::{GPUTerrainData, StreamConfig, TileStreamer},
-    tile_selector::{BakeValues, TileSelector},
+    terrain_renderer::TerrainRenderer,
     tiles::{TerrainSize, TileLayout, TileStore, WorldValues},
 };
 
 mod bake;
 mod compress;
 mod mips;
+mod node_selector;
 mod stream;
-mod tile_selector;
+mod terrain_renderer;
 mod tiles;
 
 pub struct ViewProjection {
@@ -29,6 +31,31 @@ pub struct ViewProjection {
     pub frustum_planes: [[f32; 4]; 6],
 }
 impl ViewProjection {
+    pub fn new(view_proj: [[f32; 4]; 4], position: [f32; 3]) -> Self {
+        let m = &view_proj;
+        let row = |r: usize| [m[0][r], m[1][r], m[2][r], m[3][r]];
+        let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
+        let add = |a: [f32; 4], b: [f32; 4]| std::array::from_fn(|i| a[i] + b[i]);
+        let sub = |a: [f32; 4], b: [f32; 4]| std::array::from_fn(|i| a[i] - b[i]);
+        let normalize = |p: [f32; 4]| {
+            let l = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            p.map(|c| c / l)
+        };
+        let frustum_planes = [
+            add(r3, r0), // left
+            sub(r3, r0), // right
+            add(r3, r1), // bottom
+            sub(r3, r1), // top
+            r2,          // near (0..1 depth)
+            sub(r3, r2), // far
+        ]
+        .map(normalize);
+        Self {
+            view_proj,
+            position,
+            frustum_planes,
+        }
+    }
     pub(crate) fn fov_and_aspect(&self) -> (f32, f32) {
         let m = &self.view_proj; // column-major: m[col][row]
         let row_len = |r: usize| (m[0][r] * m[0][r] + m[1][r] * m[1][r] + m[2][r] * m[2][r]).sqrt();
@@ -48,10 +75,19 @@ pub struct ViewUniformData {
     _pad: f32,
 }
 
+impl From<&ViewProjection> for ViewUniformData {
+    fn from(v: &ViewProjection) -> Self {
+        Self {
+            view_proj: v.view_proj,
+            frustum_planes: v.frustum_planes,
+            position: v.position,
+            _pad: 0.0,
+        }
+    }
+}
 struct ViewUniform {
     buf: wgpu::Buffer,
 }
-
 impl ViewUniform {
     fn new(device: &wgpu::Device, view_proj: &ViewProjection) -> Self {
         let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -72,14 +108,19 @@ impl ViewUniform {
 pub struct Terrain {
     tile_streamer: TileStreamer,
     gpu_terrain_data: GPUTerrainData,
-    tile_selector: TileSelector,
+    node_selector: NodeSelector,
+    terrain_renderer: TerrainRenderer,
     view_uniform: ViewUniform,
     world: WorldValues,
 }
 
 impl Terrain {
-    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, view: &ViewUniformData) {
-        queue.write_buffer(&self.view_uniform.buf, 0, bytemuck::bytes_of(view));
+    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, view: &ViewProjection) {
+        queue.write_buffer(
+            &self.view_uniform.buf,
+            0,
+            bytemuck::bytes_of(&ViewUniformData::from(view)),
+        );
         self.tile_streamer.update(
             device,
             queue,
@@ -90,7 +131,15 @@ impl Terrain {
         let mut encoder = device.create_command_encoder(&wgpu::wgt::CommandEncoderDescriptor {
             label: Some("encoder"),
         });
-        self.tile_selector.select_tiles(&mut encoder);
+        self.node_selector.select_nodes(&mut encoder);
+        self.tile_streamer
+            .record_readback(&mut encoder, &self.gpu_terrain_data);
+        queue.submit([encoder.finish()]);
+    }
+
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.terrain_renderer
+            .render(pass, &self.node_selector.bind_groups.selected_nodes_buffer);
     }
 }
 
@@ -103,6 +152,8 @@ pub fn load_terrain(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     stream_config: StreamConfig,
+    color_format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
 ) -> Result<Terrain, Box<dyn Error>> {
     let heightmap = image::ImageReader::open(height_path)?.decode()?;
     let diffuse = image::ImageReader::open(diffuse_path)?.decode()?; // TODO: diffuse texture
@@ -116,6 +167,8 @@ pub fn load_terrain(
     build_compressed_tile_files(&tile_layout, &height_mips, tile_path)?;
     let store = Arc::new(TileStore::open(tile_path)?);
     let gpu_terrain_data = GPUTerrainData::new(device, queue, &tile_layout, &stream_config);
+    let slots_per_axis = stream_config.slots_per_axis.clone();
+    let tile_texels = tile_layout.stored_tile_size();
     let streamer = TileStreamer::new(queue, &tile_layout, store, stream_config, &gpu_terrain_data);
     let (node_count, mm_levels) = min_max_levels(
         &height_mips,
@@ -127,9 +180,11 @@ pub fn load_terrain(
     let k =
         settings.lod0_range / (settings.min_quad_node_size.get() as f32 * world.scale_factors[0]);
     let disc = std::f32::consts::PI * (k + 3.0 * std::f32::consts::SQRT_2).powi(2);
-    let queue_capacity = (tile_layout.root_tiles[0] * tile_layout.root_tiles[1])
-        .max((disc * 2.0) as u32)
-        .next_power_of_two();
+
+    let root_nodes = tile_layout.root_tiles[0]
+        * tile_layout.root_tiles[1]
+        * tile_layout.nodes_per_tile_axis.pow(2);
+    let queue_capacity = root_nodes.max((disc * 2.0) as u32).next_power_of_two();
 
     let bake_values = BakeValues {
         map_min: settings.map.map_min,
@@ -149,7 +204,7 @@ pub fn load_terrain(
         _pad: [0, 0, 0],
     };
     let view_uniform = ViewUniform::new(device, view_proj);
-    let tile_selector = TileSelector::new(
+    let node_selector = NodeSelector::new(
         bake_values,
         min_max_texture,
         device,
@@ -160,11 +215,27 @@ pub fn load_terrain(
         &view_uniform,
     );
 
+    let terrain_renderer = TerrainRenderer::new(
+        device,
+        queue,
+        &bake_values,
+        &settings,
+        slots_per_axis,
+        tile_texels,
+        &node_selector,
+        &view_uniform,
+        diffuse,
+        &gpu_terrain_data,
+        color_format,
+        depth_format,
+    );
+
     Ok(Terrain {
         tile_streamer: streamer,
+        terrain_renderer,
         gpu_terrain_data,
         world,
-        tile_selector,
+        node_selector,
         view_uniform: view_uniform,
     })
 }
@@ -172,11 +243,11 @@ pub fn load_terrain(
 pub struct MapDimensions {
     // the world position of sample (0,0) at height val 0
     pub map_min: [f32; 3],
-    size: [f32; 3],
+    pub size: [f32; 3],
 }
 pub struct CDLODSettings {
-    map: MapDimensions,
-    lod0_range: f32,
+    pub map: MapDimensions,
+    pub lod0_range: f32,
 
     pub terrain_size: TerrainSize,
     /// the minimum number of samples in sample space of the source terrain texture
