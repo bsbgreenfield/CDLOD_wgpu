@@ -49,6 +49,7 @@ pub(crate) struct TileStreamer {
     /// decoded tiles waiting on the upload budget or a free slot
     ready: VecDeque<(u32, Vec<u8>)>,
     in_flight: usize,
+    init: bool,
 }
 
 pub(crate) struct GPUTerrainData {
@@ -182,7 +183,6 @@ impl TileStreamer {
         layout: &TileLayout,
         store: Arc<TileStore>,
         config: StreamConfig,
-        gpu_data: &GPUTerrainData,
     ) -> Self {
         let tile_count = layout.tile_count() as usize;
         let slot_count = (config.slots_per_axis * config.slots_per_axis) as usize;
@@ -215,7 +215,7 @@ impl TileStreamer {
             })
             .expect("spawn tile decoder");
 
-        let mut streamer = Self {
+        Self {
             layout: layout.clone(),
             config,
             frame: 0,
@@ -232,24 +232,34 @@ impl TileStreamer {
             decoded_rx,
             ready: VecDeque::new(),
             in_flight: 0,
-        };
+            init: false,
+        }
+    }
 
-        // roots are first in flat order: load them synchronously into slots 0..pinned
-        for tile in 0..pinned as u32 {
-            streamer.jobs_tx.send(tile).unwrap();
+    pub(crate) fn init(&mut self, queue: &wgpu::Queue, gpu_data: &GPUTerrainData) {
+        if self.init {
+            return;
+        }
+        let jobs_tx = self.jobs_tx.clone();
+        let decoded_rx = self.decoded_rx.clone();
+        let pinned = self.pinned.clone();
+
+        for tile in 0..pinned {
+            jobs_tx.send(tile as u32).unwrap()
         }
         for _ in 0..pinned {
-            let (tile, bytes) = streamer.decoded_rx.recv().expect("tile decoder died");
-            streamer.upload(
+            let (tile, data) = decoded_rx.recv().expect("tile decoder died");
+            self.upload(
                 queue,
                 tile,
                 tile as u16,
-                &bytes,
+                &data,
                 &gpu_data.atlas,
                 &gpu_data.residency,
             );
         }
-        streamer
+
+        self.init = true;
     }
 
     /// Call once per frame, before encoding. Everything it writes goes through the queue,
@@ -262,7 +272,12 @@ impl TileStreamer {
         gpu_data: &GPUTerrainData,
         world: &WorldValues,
     ) {
+        // block until the root tiles are loaded
+        if !self.init {
+            self.init(queue, gpu_data);
+        }
         self.frame += 1;
+
         let _ = device.poll(wgpu::PollType::Poll); // runs map callbacks of finished readbacks
 
         // for the pending request frames

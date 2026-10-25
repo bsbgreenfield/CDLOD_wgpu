@@ -5,7 +5,6 @@ use std::{
     sync::Arc,
 };
 
-use image::DynamicImage;
 use wgpu::util::DeviceExt;
 
 use crate::{
@@ -33,6 +32,8 @@ mod node_selector;
 pub mod stream;
 mod terrain_renderer;
 mod tiles;
+
+pub mod cpu_clipmap;
 
 pub struct ViewProjection {
     pub view_proj: [[f32; 4]; 4],
@@ -121,12 +122,12 @@ pub struct HeightReader {
 }
 
 pub struct Terrain {
-    tile_streamer: TileStreamer,
+    world: WorldValues,
     gpu_terrain_data: GPUTerrainData,
+    view_uniform: ViewUniform,
+    tile_streamer: TileStreamer,
     node_selector: NodeSelector,
     terrain_renderer: TerrainRenderer,
-    view_uniform: ViewUniform,
-    world: WorldValues,
 }
 
 impl Terrain {
@@ -214,13 +215,14 @@ pub fn load_terrain(
         GPUTerrainData::new(device, queue, &height_reader.tile_layout, &stream_config);
     let slots_per_axis = stream_config.slots_per_axis.clone();
     let tile_texels = height_reader.tile_layout.stored_tile_size();
-    let streamer = TileStreamer::new(
+    let mut streamer = TileStreamer::new(
         queue,
         &height_reader.tile_layout,
         height_reader.tiles.clone(),
         stream_config,
-        &gpu_terrain_data,
     );
+
+    streamer.init(queue, &gpu_terrain_data);
     let (node_count, mm_levels) = min_max_levels(
         &height_mips,
         settings.min_quad_node_size.get() as usize,
