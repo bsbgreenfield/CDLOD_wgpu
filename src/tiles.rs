@@ -1,17 +1,10 @@
-use crate::{CDLODSettings, MapDimensions, ViewProjection};
+use crate::{CDLODSettings, MapDimensions, TerrainSize, ViewProjection};
 
 pub const MAX_LODS: u32 = 16;
 pub const TILE_GUTTER: u32 = 1;
 const TILE_FILE_MAGIC: [u8; 4] = *b"CDLT";
 const TILE_FILE_VERSION: u32 = 1;
 const TILE_FILE_HEADER_LEN: usize = 20;
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerrainSize {
-    T2,
-    T4,
-    T8,
-    T16,
-}
 
 impl TerrainSize {
     pub(crate) const fn intervals(self) -> u32 {

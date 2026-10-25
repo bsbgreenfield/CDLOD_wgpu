@@ -1,6 +1,6 @@
 use image::{ImageBuffer, Luma};
 
-use crate::tiles::TerrainSize;
+use crate::TerrainSize;
 
 pub(crate) struct ConformedHeightMap {
     image: image::ImageBuffer<Luma<u16>, Vec<u16>>,

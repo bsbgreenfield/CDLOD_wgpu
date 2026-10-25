@@ -8,7 +8,7 @@ use rayon::{
 use wgpu::util::DeviceExt;
 use zstd::zstd_safe::CParameter;
 
-pub(crate) struct HeightMips {
+pub struct HeightMips {
     pub(crate) level_sizes: Vec<u32>,
     pub(crate) levels: Vec<Vec<u16>>,
 }

@@ -92,6 +92,7 @@ fn create_diffuse_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     diffuse: &image::DynamicImage,
+    texture_format: &wgpu::TextureFormat,
 ) -> wgpu::Texture {
     let mut level = diffuse.to_rgba8();
     let (w, h) = level.dimensions();
@@ -119,7 +120,7 @@ fn create_diffuse_texture(
             mip_level_count: mip_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: *texture_format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         },
@@ -191,8 +192,8 @@ pub(crate) struct TerrainRenderer {
     bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    diffuse_image: image::DynamicImage,
-    render_params: wgpu::Buffer,
+    color_format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
 }
 
 impl TerrainRenderer {
@@ -217,7 +218,7 @@ impl TerrainRenderer {
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
     ) -> Self {
-        let diffuse_texture = create_diffuse_texture(device, queue, &diffuse);
+        let diffuse_texture = create_diffuse_texture(device, queue, &diffuse, &color_format);
         let diffuse_view = diffuse_texture.create_view(&Default::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("terrain diffuse sampler"),
@@ -255,12 +256,13 @@ impl TerrainRenderer {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -327,8 +329,8 @@ impl TerrainRenderer {
             bind_group: bg,
             vertex_buffer: vb,
             index_buffer: ib,
-            diffuse_image: diffuse,
-            render_params,
+            color_format,
+            depth_format,
         }
     }
 }

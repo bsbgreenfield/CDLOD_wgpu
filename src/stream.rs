@@ -23,7 +23,6 @@ pub struct StreamConfig {
     pub stale_frames: u32,
 }
 
-use std::sync::mpsc::{Receiver, Sender};
 pub(crate) struct TileStreamer {
     layout: TileLayout,
     config: StreamConfig,
@@ -31,8 +30,8 @@ pub(crate) struct TileStreamer {
 
     free_staging: Vec<usize>, // free list
 
-    mapped_tx: Sender<(usize, bool)>,
-    mapped_rx: Receiver<(usize, bool)>,
+    mapped_request_tx: crossbeam::channel::Sender<(usize, bool)>,
+    mapped_request_rx: crossbeam::channel::Receiver<(usize, bool)>,
 
     // CPU mirror of residency
     tile_slot: Vec<u16>,
@@ -45,8 +44,8 @@ pub(crate) struct TileStreamer {
     pending: HashMap<u32, u32>,
     /// pending tiles not yet sent to the decoder
     fifo: VecDeque<u32>,
-    jobs: Sender<u32>,
-    decoded: Receiver<(u32, Vec<u8>)>,
+    jobs_tx: crossbeam::channel::Sender<u32>,
+    decoded_rx: crossbeam::channel::Receiver<(u32, Vec<u8>)>,
     /// decoded tiles waiting on the upload budget or a free slot
     ready: VecDeque<(u32, Vec<u8>)>,
     in_flight: usize,
@@ -193,17 +192,18 @@ impl TileStreamer {
         );
         let pinned = (layout.root_tiles[0] * layout.root_tiles[1]) as usize;
         assert!(pinned < slot_count, "atlas can't hold the root tiles");
-        let (mapped_tx, mapped_rx) = std::sync::mpsc::channel();
+        let (mapped_request_tx, mapped_request_rx) =
+            crossbeam::channel::bounded::<(usize, bool)>(config.request_capacity as usize);
 
         // decoder thread: tile index in, upload-ready bytes out
-        let (jobs, job_rx) = std::sync::mpsc::channel::<u32>();
-        let (decoded_tx, decoded) = std::sync::mpsc::channel();
+        let (jobs_tx, jobs_rx) = crossbeam::channel::bounded::<u32>(config.max_inflight);
+        let (decoded_tx, decoded_rx) = crossbeam::channel::bounded(config.max_inflight);
         std::thread::Builder::new()
             .name("tile decoder".into())
             .spawn(move || {
                 let mut dec = store.decoder().expect("zstd decoder");
                 let mut heights = vec![0u16; store.n * store.n];
-                for tile in job_rx {
+                for tile in jobs_rx {
                     store
                         .load(&mut dec, tile, &mut heights)
                         .expect("corrupt tile file");
@@ -220,26 +220,26 @@ impl TileStreamer {
             config,
             frame: 0,
             free_staging: (0..READBACK_RING).collect(),
-            mapped_tx,
-            mapped_rx,
+            mapped_request_tx,
+            mapped_request_rx,
             tile_slot: vec![NOT_RESIDENT; tile_count],
             slot_tile: vec![u32::MAX; slot_count],
             free_slots: (pinned..slot_count).rev().map(|s| s as u16).collect(),
             pinned,
             pending: HashMap::new(),
             fifo: VecDeque::new(),
-            jobs,
-            decoded,
+            jobs_tx,
+            decoded_rx,
             ready: VecDeque::new(),
             in_flight: 0,
         };
 
         // roots are first in flat order: load them synchronously into slots 0..pinned
         for tile in 0..pinned as u32 {
-            streamer.jobs.send(tile).unwrap();
+            streamer.jobs_tx.send(tile).unwrap();
         }
         for _ in 0..pinned {
-            let (tile, bytes) = streamer.decoded.recv().expect("tile decoder died");
+            let (tile, bytes) = streamer.decoded_rx.recv().expect("tile decoder died");
             streamer.upload(
                 queue,
                 tile,
@@ -267,7 +267,7 @@ impl TileStreamer {
 
         // for the pending request frames
         // map the requested tile to cpu memory and add to pending
-        while let Ok((i, mapped)) = self.mapped_rx.try_recv() {
+        while let Ok((i, mapped)) = self.mapped_request_rx.try_recv() {
             if mapped {
                 self.ingest(i, gpu_data);
             }
@@ -289,12 +289,12 @@ impl TileStreamer {
             }
 
             // add in flight job
-            self.jobs.send(tile).expect("tile decoder died");
+            self.jobs_tx.send(tile).expect("tile decoder died");
             self.in_flight += 1;
         }
 
         // decoder -> GPU
-        self.ready.extend(self.decoded.try_iter());
+        self.ready.extend(self.decoded_rx.try_iter());
         let mut uploaded = 0;
 
         // loop through the received  tile bytes
@@ -337,7 +337,7 @@ impl TileStreamer {
         if let Some(i) = self.free_staging.pop() {
             let staging = &gpu_data.staging[i];
             encoder.copy_buffer_to_buffer(&gpu_data.requests, 0, staging, 0, staging.size());
-            let tx = self.mapped_tx.clone();
+            let tx = self.mapped_request_tx.clone();
             encoder.map_buffer_on_submit(staging, wgpu::MapMode::Read, .., move |r| {
                 let _ = tx.send((i, r.is_ok()));
             });
@@ -352,8 +352,10 @@ impl TileStreamer {
             let view = gpu_data.staging[i]
                 .get_mapped_range(..)
                 .expect("readback not mapped");
+            // requests buffer holds count meta data
             let count = u32::from_le_bytes(view[..4].try_into().unwrap())
                 .min(self.config.request_capacity) as usize;
+            // move data into batch
             view[4..][..count * 4]
                 .chunks_exact(4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
@@ -361,7 +363,7 @@ impl TileStreamer {
         };
         gpu_data.staging[i].unmap();
 
-        // flat indices run coarse -> fine, so coarser tiles queue first
+        // flat indices go coarse -> fine, so coarser tiles queue first
         batch.sort_unstable();
         for tile in batch {
             // uploaded since this readback was recorded

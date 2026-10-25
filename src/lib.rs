@@ -5,23 +5,32 @@ use std::{
     sync::Arc,
 };
 
+use image::DynamicImage;
 use wgpu::util::DeviceExt;
 
 use crate::{
     mips::{
-        build_compressed_tile_files, build_height_mipmap_cpu, get_min_max_texture, min_max_levels,
+        HeightMips, build_compressed_tile_files, build_height_mipmap_cpu, get_min_max_texture,
+        min_max_levels,
     },
     node_selector::{BakeValues, NodeSelector},
     stream::{GPUTerrainData, StreamConfig, TileStreamer},
     terrain_renderer::TerrainRenderer,
-    tiles::{TerrainSize, TileLayout, TileStore, WorldValues},
+    tiles::{TileLayout, TileStore, WorldValues},
 };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerrainSize {
+    T2,
+    T4,
+    T8,
+    T16,
+}
 
 mod bake;
 mod compress;
 mod mips;
 mod node_selector;
-mod stream;
+pub mod stream;
 mod terrain_renderer;
 mod tiles;
 
@@ -105,6 +114,12 @@ impl ViewUniform {
     }
 }
 
+#[derive(Clone)]
+pub struct HeightReader {
+    tiles: Arc<TileStore>,
+    tile_layout: TileLayout,
+}
+
 pub struct Terrain {
     tile_streamer: TileStreamer,
     gpu_terrain_data: GPUTerrainData,
@@ -143,37 +158,73 @@ impl Terrain {
     }
 }
 
-pub fn load_terrain(
+pub struct TerrainInputs<'a> {
+    pub diffuse_path: PathBuf,
+    pub height_path: PathBuf,
+    pub tile_path: &'a Path,
+    pub color_format: wgpu::TextureFormat,
+    pub depth_format: wgpu::TextureFormat,
+}
+
+pub fn create_tile_store(
     height_path: PathBuf,
-    diffuse_path: PathBuf,
     tile_path: &Path,
+    settings: &CDLODSettings,
+) -> Result<(HeightReader, HeightMips), Box<dyn Error>> {
+    let heightmap = image::ImageReader::open(height_path.clone())?.decode()?;
+    let tile_layout = TileLayout::new(&settings, heightmap.width(), heightmap.height());
+    let height_mips = build_height_mipmap_cpu(&heightmap, &tile_layout);
+    std::fs::create_dir_all(tile_path)?;
+    let file_stem = &height_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("terrain");
+    let tile_file = tile_path.join(format!("{file_stem}.cdlt"));
+    if !tile_file.exists() {
+        build_compressed_tile_files(&tile_layout, &height_mips, &tile_file)?;
+    }
+    let store = Arc::new(TileStore::open(&tile_file)?);
+    Ok((
+        HeightReader {
+            tiles: store,
+            tile_layout,
+        },
+        height_mips,
+    ))
+}
+
+pub fn load_terrain(
     view_proj: &ViewProjection,
-    settings: CDLODSettings,
+    settings: &CDLODSettings,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     stream_config: StreamConfig,
     color_format: wgpu::TextureFormat,
     depth_format: wgpu::TextureFormat,
+    height_reader: &HeightReader,
+    height_mips: &HeightMips,
+    diffuse_path: &PathBuf,
 ) -> Result<Terrain, Box<dyn Error>> {
-    let heightmap = image::ImageReader::open(height_path)?.decode()?;
     let diffuse = image::ImageReader::open(diffuse_path)?.decode()?; // TODO: diffuse texture
-
-    let tile_layout = TileLayout::new(&settings, heightmap.width(), heightmap.height());
-
-    let world = WorldValues::new(&settings, &tile_layout);
+    let world = WorldValues::new(&settings, &height_reader.tile_layout);
 
     let request_capacity = stream_config.request_capacity;
-    let height_mips = build_height_mipmap_cpu(&heightmap, &tile_layout);
-    build_compressed_tile_files(&tile_layout, &height_mips, tile_path)?;
-    let store = Arc::new(TileStore::open(tile_path)?);
-    let gpu_terrain_data = GPUTerrainData::new(device, queue, &tile_layout, &stream_config);
+
+    let gpu_terrain_data =
+        GPUTerrainData::new(device, queue, &height_reader.tile_layout, &stream_config);
     let slots_per_axis = stream_config.slots_per_axis.clone();
-    let tile_texels = tile_layout.stored_tile_size();
-    let streamer = TileStreamer::new(queue, &tile_layout, store, stream_config, &gpu_terrain_data);
+    let tile_texels = height_reader.tile_layout.stored_tile_size();
+    let streamer = TileStreamer::new(
+        queue,
+        &height_reader.tile_layout,
+        height_reader.tiles.clone(),
+        stream_config,
+        &gpu_terrain_data,
+    );
     let (node_count, mm_levels) = min_max_levels(
         &height_mips,
         settings.min_quad_node_size.get() as usize,
-        (tile_layout.max_mip + 1) as usize,
+        (height_reader.tile_layout.max_mip + 1) as usize,
     );
     let min_max_texture = get_min_max_texture(node_count, mm_levels, device, queue);
 
@@ -181,24 +232,24 @@ pub fn load_terrain(
         settings.lod0_range / (settings.min_quad_node_size.get() as f32 * world.scale_factors[0]);
     let disc = std::f32::consts::PI * (k + 3.0 * std::f32::consts::SQRT_2).powi(2);
 
-    let root_nodes = tile_layout.root_tiles[0]
-        * tile_layout.root_tiles[1]
-        * tile_layout.nodes_per_tile_axis.pow(2);
+    let root_nodes = height_reader.tile_layout.root_tiles[0]
+        * height_reader.tile_layout.root_tiles[1]
+        * height_reader.tile_layout.nodes_per_tile_axis.pow(2);
     let queue_capacity = root_nodes.max((disc * 2.0) as u32).next_power_of_two();
 
     let bake_values = BakeValues {
         map_min: settings.map.map_min,
-        max_mip: tile_layout.max_mip,
-        root_tiles: tile_layout.root_tiles,
+        max_mip: height_reader.tile_layout.max_mip,
+        root_tiles: height_reader.tile_layout.root_tiles,
         scale_factors: world.scale_factors,
-        nodes_per_tile_axis: tile_layout.nodes_per_tile_axis,
+        nodes_per_tile_axis: height_reader.tile_layout.nodes_per_tile_axis,
         queue_capacity: queue_capacity,
         selected_capacity: tiles::selected_capacity(
             settings.lod0_range,
             settings.min_quad_node_size.get(),
             world.scale_factors[0],
             view_proj,
-            tile_layout.max_mip,
+            height_reader.tile_layout.max_mip,
         ),
         request_capacity: request_capacity,
         _pad: [0, 0, 0],
@@ -209,7 +260,7 @@ pub fn load_terrain(
         min_max_texture,
         device,
         &settings,
-        &tile_layout,
+        &height_reader.tile_layout,
         &gpu_terrain_data,
         &world,
         &view_uniform,

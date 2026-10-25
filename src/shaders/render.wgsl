@@ -54,7 +54,7 @@ fn vs_main(@builtin(instance_index) instance_idx: u32, @location(0) v_coords: ve
 	let selected_node = selected.nodes[instance_idx];
 	let lod = selected_node.info >> 16u;
 	let tile_slot = selected_node.info & 0xFFFFu;
-	let node_coords = vec2<u32>(selected_node.xz >> 16u, node.xz & 0xFFFFu);
+	let node_coords = vec2<u32>(selected_node.xz >> 16u, selected_node.xz & 0xFFFFu);
 
 	// use data to sample texture atlas
 	let slot_mask = (1u << params.slot_shift) - 1u;
@@ -70,16 +70,22 @@ fn vs_main(@builtin(instance_index) instance_idx: u32, @location(0) v_coords: ve
 	// lod space -> mip space -> sample space -> world space
 	let mip_coords = node_coords * params.node_size + v_coords;
 	let sample_coords = mip_coords << vec2<u32>(lod);
-	let world_coords = params.map_min + vec3<f32>(sample_coords.x, f32(height_val), sample_coords.y) * params.scale_factors;
+	let world_coords = params.map_min + vec3<f32>(f32(sample_coords.x), f32(height_val), f32(sample_coords.y)) * params.scale_factors;
 
 	var out: VsOut;
 	out.clip = camera.view_proj * vec4<f32>(world_coords, 1.0);
-	out.uv = (f32( sample_coords ) + 0.5) * params.texel_scale_factor;
 
+	out.uv = vec2<f32>(f32(sample_coords[0]) + 0.5, f32(sample_coords[1]) + 0.5) * params.texel_scale_factor;
 	return out;
 }
 
 @fragment
 	fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-	return textureSample(diffuse, diffuse_sampler, in.uv);
-}
+		var color =  textureSample(diffuse, diffuse_sampler, in.uv);
+		let linear = pow(vec3<f32>(color[0], color[1], color[2]), vec3<f32>(2.2));
+		let lum = dot(linear, vec3<f32>(0.2126, 0.7152, 0.0722));
+		var enhanced = mix(vec3<f32>(lum), linear, 1.2);
+		enhanced = (enhanced - 0.5) * 1.1 + 0.5;
+		enhanced = clamp(enhanced, vec3<f32>(0.0), vec3<f32>(1.0));
+		return vec4<f32>(enhanced, 1.0);
+	}
