@@ -8,6 +8,7 @@ use std::{
 use wgpu::util::DeviceExt;
 
 use crate::{
+    grass::{GrassRenderer, GrassSettings},
     mips::{
         HeightMips, build_compressed_tile_files, build_height_mipmap_cpu, get_min_max_texture,
         min_max_levels,
@@ -129,6 +130,7 @@ pub struct Terrain {
     tile_streamer: TileStreamer,
     node_selector: NodeSelector,
     terrain_renderer: TerrainRenderer,
+    grass: Option<GrassRenderer>,
 }
 
 impl Terrain {
@@ -157,6 +159,12 @@ impl Terrain {
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         self.terrain_renderer
             .render(pass, &self.node_selector.bind_groups.selected_nodes_buffer);
+        match &self.grass {
+            Some(grass_renderer) => {
+                grass_renderer.render(pass);
+            }
+            None => {}
+        }
     }
 }
 
@@ -206,6 +214,7 @@ pub fn load_terrain(
     height_reader: &HeightReader,
     height_mips: &HeightMips,
     diffuse_path: &PathBuf,
+    grass_settings: Option<GrassSettings>,
 ) -> Result<Terrain, Box<dyn Error>> {
     let diffuse = image::ImageReader::open(diffuse_path)?.decode()?; // TODO: diffuse texture
     let world = WorldValues::new(&settings, &height_reader.tile_layout);
@@ -255,9 +264,18 @@ pub fn load_terrain(
             height_reader.tile_layout.max_mip,
         ),
         request_capacity: request_capacity,
-        _pad: [0, 0, 0],
+        grass_range: grass_settings.map_or_default(|gs| gs.range),
+        grass_blade_height: grass_settings.map_or_default(|gs| gs.blade_height),
+        _pad: 0,
     };
     let view_uniform = ViewUniform::new(device, view_proj);
+    let grass_groups_x = match &grass_settings {
+        Some(gs) => Some(grass::groups_per_node(
+            settings.min_quad_node_size.get(),
+            gs.cell_subdiv.max(1),
+        )),
+        None => None,
+    };
     let node_selector = NodeSelector::new(
         bake_values,
         min_max_texture,
@@ -267,6 +285,7 @@ pub fn load_terrain(
         &gpu_terrain_data,
         &world,
         &view_uniform,
+        grass_groups_x,
     );
 
     let terrain_renderer = TerrainRenderer::new(
@@ -284,8 +303,30 @@ pub fn load_terrain(
         depth_format,
     );
 
+    let grass_renderer = match grass_settings {
+        Some(gs) => Some(GrassRenderer::new(
+            device,
+            &bake_values,
+            settings,
+            &gs,
+            slots_per_axis,
+            tile_texels,
+            &view_uniform,
+            node_selector
+                .bind_groups
+                .grass_nodes_buffer
+                .as_ref()
+                .expect("should have been created"),
+            &gpu_terrain_data.atlas_view,
+            color_format,
+            depth_format,
+        )),
+        None => None,
+    };
+
     Ok(Terrain {
         tile_streamer: streamer,
+        grass: grass_renderer,
         terrain_renderer,
         gpu_terrain_data,
         world,

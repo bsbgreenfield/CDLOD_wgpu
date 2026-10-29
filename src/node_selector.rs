@@ -9,9 +9,18 @@ pub(crate) struct BakeValues {
     pub queue_capacity: u32,
     pub selected_capacity: u32,
     pub request_capacity: u32,
-    pub _pad: [u32; 3],
+    pub grass_range: f32,
+    pub grass_blade_height: f32,
+    pub _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+pub(crate) struct GrassNodesHeader {
+    pub groups_x: u32, // (node_size * cell_subdiv)^2
+    pub count: u32,    // groups_y, filled by the select pass
+    pub groups_z: u32,
+}
 #[repr(C)]
 #[derive(Debug, bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
 pub(crate) struct LODArgs {
@@ -77,6 +86,31 @@ pub(crate) fn get_selected_nodes_buffer(
     buf
 }
 
+fn get_grass_nodes_buffer(
+    device: &wgpu::Device,
+    bake_values: &BakeValues,
+    groups_x: u32,
+) -> wgpu::Buffer {
+    let header = size_of::<GrassNodesHeader>();
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("grass nodes"),
+        size: (header + size_of::<NodeWork>() * bake_values.selected_capacity as usize) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: true,
+    });
+    buf.slice(..header as u64)
+        .get_mapped_range_mut()
+        .unwrap()
+        .copy_from_slice(bytemuck::bytes_of(&GrassNodesHeader {
+            groups_x,
+            count: 0,
+            groups_z: 1,
+        }));
+    buf.unmap();
+    buf
+}
 fn get_node_work_queue(device: &wgpu::Device, bake_values: BakeValues) -> wgpu::Buffer {
     let size =
         (size_of::<LODArgs>() + bake_values.queue_capacity as usize * size_of::<NodeWork>()) as u64;
@@ -183,12 +217,36 @@ impl NodeSelector {
         gpu_terrain_data: &GPUTerrainData,
         world: &WorldValues,
         view_uniform: &ViewUniform,
+        grass_groups_x: Option<u32>,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tile selection shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/select_tiles.wgsl").into()),
-        });
-        let layout = create_layouts(device);
+        let limits = device.limits();
+        let constants = [
+            (
+                "MAX_MESH_GROUPS_PER_DIM",
+                limits.max_mesh_workgroups_per_dimension as f64,
+            ),
+            (
+                "MAX_MESH_GROUPS_TOTAL",
+                limits.max_mesh_workgroup_total_count as f64,
+            ),
+        ];
+        let compilation_options = || wgpu::PipelineCompilationOptions {
+            constants: &constants,
+            ..Default::default()
+        };
+        let shader = match grass_groups_x {
+            Some(_) => device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tile selection shader with grass"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/select_tiles_with_grass.wgsl").into(),
+                ),
+            }),
+            None => device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tile selection shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/select_tiles.wgsl").into()),
+            }),
+        };
+        let layout = create_layouts(device, grass_groups_x.is_some());
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tile select pipeline layout"),
@@ -205,7 +263,11 @@ impl NodeSelector {
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("select_nodes_for_level"),
-            compilation_options: Default::default(),
+            compilation_options: if grass_groups_x.is_some() {
+                compilation_options()
+            } else {
+                Default::default()
+            },
             cache: None,
         });
         let reset_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -213,7 +275,11 @@ impl NodeSelector {
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("reset_out_queue"),
-            compilation_options: Default::default(),
+            compilation_options: if grass_groups_x.is_some() {
+                compilation_options()
+            } else {
+                Default::default()
+            },
             cache: None,
         });
         let clamp_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -221,7 +287,11 @@ impl NodeSelector {
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("clamp_selected"),
-            compilation_options: Default::default(),
+            compilation_options: if grass_groups_x.is_some() {
+                compilation_options()
+            } else {
+                Default::default()
+            },
             cache: None,
         });
 
@@ -254,6 +324,7 @@ impl NodeSelector {
             view_uniform,
             &min_max_tex_view,
             &layout,
+            grass_groups_x,
         );
         Self {
             bake_values,
@@ -268,6 +339,9 @@ impl NodeSelector {
     }
     pub(crate) fn select_nodes(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.clear_buffer(&self.bind_groups.selected_nodes_buffer, 4, Some(4));
+        if let Some(g) = &self.bind_groups.grass_nodes_buffer {
+            encoder.clear_buffer(g, 4, Some(4));
+        }
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_bind_group(1, &self.bind_groups.camera, &[]);
         pass.set_bind_group(2, &self.bind_groups.bake, &[]);
@@ -363,6 +437,7 @@ pub(crate) struct NodeSelectorBindGroups {
     levels_buffer: wgpu::Buffer,
     bake_values_buffer: wgpu::Buffer,
     pub(crate) selected_nodes_buffer: wgpu::Buffer,
+    pub(crate) grass_nodes_buffer: Option<wgpu::Buffer>,
     queue_a_bg: wgpu::BindGroup,
     queue_b_bg: wgpu::BindGroup,
     root_queue_bg: wgpu::BindGroup,
@@ -384,6 +459,7 @@ impl NodeSelectorBindGroups {
         view_uniform: &ViewUniform,
         min_max_texture_view: &wgpu::TextureView,
         layouts: &NodeSelectorLayouts,
+        grass_groups_x: Option<u32>,
     ) -> Self {
         let queue_a_bg = Self::create_queues_bg(queue_a, queue_b, device, &layouts.queues);
         let queue_b_bg = Self::create_queues_bg(queue_b, queue_a, device, &layouts.queues);
@@ -406,8 +482,15 @@ impl NodeSelectorBindGroups {
         );
         let selected_nodes_buffer =
             get_selected_nodes_buffer(device, &bake_values, settings.min_quad_node_size.get());
+
+        let grass_nodes_buffer = match grass_groups_x {
+            Some(x) => Some(get_grass_nodes_buffer(device, bake_values, x)),
+            None => None,
+        };
+
         let state = Self::create_state_bg(
             &selected_nodes_buffer,
+            grass_nodes_buffer.as_ref(),
             &gpu_terrain_data.residency_view,
             &gpu_terrain_data.request_flags,
             &gpu_terrain_data.requests,
@@ -417,6 +500,7 @@ impl NodeSelectorBindGroups {
 
         Self {
             selected_nodes_buffer,
+            grass_nodes_buffer,
             levels_buffer,
             bake_values_buffer,
             queue_a_bg,
@@ -519,50 +603,64 @@ impl NodeSelectorBindGroups {
 
     fn create_state_bg(
         selected_nodes_buffer: &wgpu::Buffer,
+        grass_nodes_buffer: Option<&wgpu::Buffer>,
         residency_view: &wgpu::TextureView,
         request_flags_buffer: &wgpu::Buffer,
         request_list_buffer: &wgpu::Buffer,
         layout: &wgpu::BindGroupLayout,
         device: &wgpu::Device,
     ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("state bg"),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: selected_nodes_buffer,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(residency_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: request_flags_buffer,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: request_list_buffer,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-            ],
-        })
+        let selected_nodes = wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: selected_nodes_buffer,
+                offset: 0,
+                size: None,
+            }),
+        };
+        let res_view = wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::TextureView(residency_view),
+        };
+        let request_flags = wgpu::BindGroupEntry {
+            binding: 2,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: request_flags_buffer,
+                offset: 0,
+                size: None,
+            }),
+        };
+        let request_list = wgpu::BindGroupEntry {
+            binding: 3,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: request_list_buffer,
+                offset: 0,
+                size: None,
+            }),
+        };
+        let grass_nodes = match grass_nodes_buffer {
+            Some(gnb) => Some(wgpu::BindGroupEntry {
+                binding: 4,
+                resource: gnb.as_entire_binding(),
+            }),
+            None => None,
+        };
+        match grass_nodes {
+            Some(gn) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("state with grass"),
+                layout,
+                entries: &[selected_nodes, res_view, request_flags, request_list, gn],
+            }),
+            None => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("state bg"),
+                layout,
+                entries: &[selected_nodes, res_view, request_flags, request_list],
+            }),
+        }
     }
 }
 
-fn create_layouts(device: &wgpu::Device) -> NodeSelectorLayouts {
+fn create_layouts(device: &wgpu::Device, with_grass: bool) -> NodeSelectorLayouts {
     NodeSelectorLayouts {
         // in_queue (ro), out_queue (rw). Binding 1 is unused, matching the shader.
         queues: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -583,14 +681,27 @@ fn create_layouts(device: &wgpu::Device) -> NodeSelectorLayouts {
             ],
         }),
         // residency, request_flags, requests
-        state: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shared state"),
-            entries: &[
-                storage(0, false),
-                uint_texture(1),
-                storage(2, false),
-                storage(3, false),
-            ],
-        }),
+        state: if with_grass {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shared state"),
+                entries: &[
+                    storage(0, false),
+                    uint_texture(1),
+                    storage(2, false),
+                    storage(3, false),
+                    storage(4, false),
+                ],
+            })
+        } else {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shared state"),
+                entries: &[
+                    storage(0, false),
+                    uint_texture(1),
+                    storage(2, false),
+                    storage(3, false),
+                ],
+            })
+        },
     }
 }

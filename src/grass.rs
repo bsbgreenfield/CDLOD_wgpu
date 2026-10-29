@@ -16,22 +16,32 @@ pub struct GrassSettings {
     pub jitter: f32,
     /// mesh groups per terrain cell axis; blades per cell = 16 * S^2
     pub cell_subdiv: u32,
+
+    /// range at which the full level of detail for the blade is drawn (4 rows for now)
+    pub lod_near: f32,
+
+    // range at which the blade drops in detail. within its 3, and beyond its 2
+    pub lod_far: f32,
 }
 
 impl Default for GrassSettings {
     fn default() -> Self {
         Self {
-            range: 40.0,
-            fade_width: 20.0,
-            blade_height: 0.30,
-            blade_width: 0.04,
+            range: 50.0,
+            fade_width: 25.0,
+            blade_height: 0.20,
+            blade_width: 0.03,
             bend: 0.35,
             jitter: 0.9,
-            cell_subdiv: 4,
+            cell_subdiv: 2,
+            lod_near: 10.,
+            lod_far: 25.,
         }
     }
 }
-
+pub(crate) fn groups_per_node(node_size: u32, cell_subdiv: u32) -> u32 {
+    (node_size * cell_subdiv).pow(2)
+}
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GrassParams {
@@ -48,7 +58,9 @@ struct GrassParams {
     bend: f32,
     jitter: f32,
     cell_subdiv: u32,
-    _pad: [u32; 3],
+    lod_near: f32,
+    lod_far: f32,
+    _pad: u32,
 }
 
 pub(crate) struct GrassRenderer {
@@ -86,7 +98,9 @@ impl GrassRenderer {
             bend: grass.bend,
             jitter: grass.jitter,
             cell_subdiv: grass.cell_subdiv,
-            _pad: [0; 3],
+            lod_near: grass.lod_near,
+            lod_far: grass.lod_far,
+            _pad: 0,
         };
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("grass params"),
@@ -164,5 +178,11 @@ impl GrassRenderer {
             params_buffer,
             grass_nodes: grass_nodes.clone(),
         }
+    }
+
+    pub(crate) fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw_mesh_tasks_indirect(&self.grass_nodes, 0);
     }
 }
