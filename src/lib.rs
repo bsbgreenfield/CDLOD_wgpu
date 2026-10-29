@@ -27,6 +27,7 @@ pub enum TerrainSize {
 
 mod bake;
 mod compress;
+pub mod grass;
 mod mips;
 mod node_selector;
 pub mod stream;
